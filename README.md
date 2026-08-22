@@ -51,8 +51,6 @@ Same form. Use the provider’s CalDAV URL and an app password when they require
 - Nextcloud: `https://your-server/remote.php/dav/`
 - Fastmail: `https://caldav.fastmail.com/`
 
-![Day view](screenshots/day.png)
-
 ## Meetings
 
 Paste a Zoom, Meet, or Teams URL on the event (`meet.google.com/…` is fine). **Join** opens it. The plugin does not sign in to Google, Zoom, or Outlook.
@@ -60,6 +58,8 @@ Paste a Zoom, Meet, or Teams URL on the event (`meet.google.com/…` is fine). *
 ## Reminders
 
 **Settings → Remind me**: off, or 5 / 10 / 15 / 30 minutes before timed events. Click a meeting toast to join.
+
+![Settings](screenshots/settings.png)
 
 ## Not included
 
