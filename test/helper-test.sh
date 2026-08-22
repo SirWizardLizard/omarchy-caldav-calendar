@@ -99,3 +99,26 @@ assert json.loads(config.read_text())["bar"]["centerAnchor"] == "sirwizardlizard
 again = mod.ensure_center_anchor("sirwizardlizard.calendar")
 assert again["changed"] is False
 print("ok - helper center anchor")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import json, os, sys, tempfile
+from pathlib import Path
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+folder = Path(tempfile.mkdtemp())
+os.environ["OMARCHY_CALENDAR_CACHE"] = str(folder)
+mod = SourceFileLoader("omarchy_calendar_helper_limits", sys.argv[1]).load_module()
+huge = folder / "cache.json"
+huge.write_bytes(b"{" + (b"x" * (mod.MAX_CACHE_BYTES + 10)))
+assert mod.read_cache() is None
+events = [{"id": str(i), "title": "t", "start": "2026-08-01T00:00:00Z", "end": "2026-08-01T01:00:00Z"} for i in range(mod.MAX_EVENTS + 50)]
+mod.write_cache({"ok": True, "calendars": [{"id": "c"}] * (mod.MAX_CALENDARS + 5), "events": events})
+cache = mod.read_cache()
+assert cache is not None
+assert len(cache["events"]) <= mod.MAX_EVENTS
+assert len(cache["calendars"]) <= mod.MAX_CALENDARS
+saved = mod.write_reminders({"minutes": 10, "fired": [f"id|{i}" for i in range(mod.MAX_FIRED + 20)]})
+assert saved["ok"] is True
+assert len(saved["fired"]) <= mod.MAX_FIRED
+too_big = {"ok": True, "provider": "mock", "events": [{"id": "x", "title": "y" * 200} for _ in range(mod.MAX_EVENTS)]}
+bounded = mod.bound_payload(too_big)
+assert len(bounded["events"]) == mod.MAX_EVENTS
+print("ok - helper bounds cache reminders and snapshots")' "$ROOT/helper/omarchy-calendar-helper"

@@ -30,6 +30,8 @@ Item {
   property var firedReminders: ({})
   property var pendingNotices: []
   property bool remindersReady: false
+  readonly property int maxHelperBytes: 8 * 1024 * 1024
+  readonly property int maxHelperErrorBytes: 64 * 1024
 
   signal refreshed()
   signal eventCreated(var event)
@@ -42,6 +44,20 @@ Item {
 
   function failMessage(payload, fallback) {
     return Model.plainDisplay((payload && payload.error && payload.error.message) || fallback || "Calendar helper failed", 400)
+  }
+
+  function helperText(out, err) {
+    var text = String(out || "")
+    if (text.length > maxHelperBytes)
+      return JSON.stringify({ ok: false, error: { message: "Calendar response was too large." } })
+    if (text)
+      return text
+    var e = String(err || "").trim()
+    if (e.length > maxHelperErrorBytes)
+      e = e.slice(0, maxHelperErrorBytes)
+    if (!e)
+      return ""
+    return JSON.stringify({ ok: false, error: { message: Model.plainDisplay(e, 400) } })
   }
 
   function snapshot(start, end, requestedProvider, forceSync) {
@@ -72,8 +88,8 @@ Item {
   }
 
   function applyCache(payload, fromLive) {
-    root.cachedCalendars = payload.calendars
-    root.cachedEvents = payload.events
+    root.cachedCalendars = (payload.calendars || []).slice(0, 200)
+    root.cachedEvents = (payload.events || []).slice(0, 8000)
     showActiveRange()
     root.status = "ready"
     root.errorMessage = ""
@@ -569,9 +585,7 @@ Item {
     stderr: StdioCollector { id: cacheErr; waitForEnd: true }
 
     onExited: function(exitCode) {
-      var text = String(cacheOut.text || "")
-      if (!text && cacheErr.text) text = JSON.stringify({ ok: false, error: { message: String(cacheErr.text).trim() } })
-      root.finishCache(text, exitCode)
+      root.finishCache(root.helperText(cacheOut.text, cacheErr.text), exitCode)
     }
   }
 
@@ -583,9 +597,7 @@ Item {
     stderr: StdioCollector { id: snapshotErr; waitForEnd: true }
 
     onExited: function(exitCode) {
-      var text = String(snapshotOut.text || "")
-      if (!text && snapshotErr.text) text = JSON.stringify({ ok: false, error: { message: String(snapshotErr.text).trim() } })
-      root.finishSnapshot(text, exitCode)
+      root.finishSnapshot(root.helperText(snapshotOut.text, snapshotErr.text), exitCode)
     }
   }
 
@@ -597,9 +609,7 @@ Item {
     stderr: StdioCollector { id: createErr; waitForEnd: true }
 
     onExited: function(exitCode) {
-      var text = String(createOut.text || "")
-      if (!text && createErr.text) text = JSON.stringify({ ok: false, error: { message: String(createErr.text).trim() } })
-      root.finishCreate(text, exitCode)
+      root.finishCreate(root.helperText(createOut.text, createErr.text), exitCode)
     }
   }
 
@@ -610,8 +620,7 @@ Item {
     stderr: StdioCollector { id: deleteErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        var text = String(deleteOut.text || deleteErr.text || "")
-        var payload = Model.parseOperationResponse(text)
+        var payload = Model.parseOperationResponse(root.helperText(deleteOut.text, deleteErr.text))
         root.errorMessage = root.failMessage(payload, "Could not delete event.")
         root.status = "error"
       }
@@ -626,9 +635,7 @@ Item {
     stderr: StdioCollector { id: updateErr; waitForEnd: true }
 
     onExited: function(exitCode) {
-      var text = String(updateOut.text || "")
-      if (!text && updateErr.text) text = JSON.stringify({ ok: false, error: { message: String(updateErr.text).trim() } })
-      root.finishUpdate(text, exitCode)
+      root.finishUpdate(root.helperText(updateOut.text, updateErr.text), exitCode)
     }
   }
 
@@ -674,9 +681,7 @@ Item {
     stderr: StdioCollector { id: setupErr; waitForEnd: true }
 
     onExited: function(exitCode) {
-      var text = String(setupOut.text || "")
-      if (!text && setupErr.text) text = JSON.stringify({ ok: false, error: { message: String(setupErr.text).trim() } })
-      root.finishSetup(text, exitCode)
+      root.finishSetup(root.helperText(setupOut.text, setupErr.text), exitCode)
     }
   }
 
@@ -685,7 +690,7 @@ Item {
     running: false
     stdout: StdioCollector { id: reminderStateOut; waitForEnd: true }
     onExited: function(exitCode) {
-      var payload = Model.parseOperationResponse(String(reminderStateOut.text || ""))
+      var payload = Model.parseOperationResponse(root.helperText(reminderStateOut.text, ""))
       root.applyReminderState(exitCode === 0 && payload.ok ? payload : { minutes: 10, fired: [] })
     }
   }

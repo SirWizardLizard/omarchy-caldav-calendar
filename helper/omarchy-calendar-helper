@@ -20,6 +20,85 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+MAX_CACHE_BYTES = 8 * 1024 * 1024
+MAX_REMINDER_BYTES = 256 * 1024
+MAX_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_ERROR_BYTES = 64 * 1024
+MAX_EVENTS = 8000
+MAX_CALENDARS = 200
+MAX_FIRED = 2000
+
+
+def read_limited_text(path: Path, max_bytes: int) -> str | None:
+    try:
+        if not path.is_file() or path.stat().st_size > max_bytes:
+            return None
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(data) > max_bytes:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def read_stdin_limited(max_bytes: int) -> str:
+    data = sys.stdin.read(max_bytes + 1)
+    if len(data.encode("utf-8")) > max_bytes:
+        raise ValueError("Request was too large.")
+    return data
+
+
+def bound_items(items, limit: int) -> list:
+    if not isinstance(items, list):
+        return []
+    return items[:limit]
+
+
+def bound_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "calendars": [],
+            "events": [],
+            "error": {"code": "invalid-payload", "message": "Invalid calendar payload."},
+        }
+    bounded = dict(payload)
+    if "calendars" in bounded:
+        bounded["calendars"] = bound_items(bounded.get("calendars"), MAX_CALENDARS)
+    if "events" in bounded:
+        bounded["events"] = bound_items(bounded.get("events"), MAX_EVENTS)
+    if "fired" in bounded:
+        bounded["fired"] = bound_items(bounded.get("fired"), MAX_FIRED)
+    error = bounded.get("error")
+    if isinstance(error, dict) and error.get("message"):
+        message = str(error.get("message") or "")
+        encoded = message.encode("utf-8")
+        if len(encoded) > MAX_ERROR_BYTES:
+            error = dict(error)
+            error["message"] = encoded[:MAX_ERROR_BYTES].decode("utf-8", errors="ignore")
+            bounded["error"] = error
+    return bounded
+
+
+def emit_json(payload: dict) -> int:
+    bounded = bound_payload(payload)
+    raw = json.dumps(bounded, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > MAX_STDOUT_BYTES:
+        bounded = {
+            "ok": False,
+            "provider": bounded.get("provider") or "",
+            "calendars": [],
+            "events": [],
+            "error": {"code": "response-too-large", "message": "Calendar response was too large."},
+        }
+        raw = json.dumps(bounded, separators=(",", ":"))
+    sys.stdout.write(raw + "\n")
+    return 0 if bounded.get("ok") else 1
+
 
 def iso(value: datetime) -> str:
     return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -232,6 +311,8 @@ def append_component_events(client, component, calendar: dict, window_start: dat
     collected = []
 
     def cb(_icomp, instance_start, instance_end, _user_data, _cancellable=None):
+        if len(events) + len(collected) >= MAX_EVENTS:
+            return False
         start, all_day = ical_time_iso(instance_start, modules, client)
         end, end_all_day = ical_time_iso(instance_end, modules, client)
         if not start:
@@ -778,7 +859,11 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) ->
                 errors.append({"calendarId": calendar["id"], "code": "query-failed", "message": "EDS query returned false."})
                 continue
             for component in components or []:
+                if len(events) >= MAX_EVENTS:
+                    break
                 append_component_events(client, component, calendar, window_start, window_end, events, modules)
+            if len(events) > MAX_EVENTS:
+                del events[MAX_EVENTS:]
         except Exception as error:
             errors.append({"calendarId": calendar["id"], "code": "calendar-error", "message": str(error)})
 
@@ -871,9 +956,12 @@ def reminders_file() -> Path:
 
 
 def read_reminders() -> dict:
+    text = read_limited_text(reminders_file(), MAX_REMINDER_BYTES)
     try:
-        data = json.loads(reminders_file().read_text(encoding="utf-8"))
+        data = json.loads(text) if text is not None else {}
     except Exception:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     minutes = data.get("minutes")
     try:
@@ -885,7 +973,7 @@ def read_reminders() -> dict:
     fired = data.get("fired") or []
     if not isinstance(fired, list):
         fired = []
-    return {"ok": True, "minutes": minutes, "fired": [str(item) for item in fired if item]}
+    return {"ok": True, "minutes": minutes, "fired": [str(item) for item in fired if item][:MAX_FIRED]}
 
 
 def write_reminders(payload: dict) -> dict:
@@ -900,10 +988,19 @@ def write_reminders(payload: dict) -> dict:
     fired = payload.get("fired")
     if not isinstance(fired, list):
         fired = current["fired"]
-    data = {"minutes": minutes, "fired": [str(item) for item in fired if item]}
+    data = {"minutes": minutes, "fired": [str(item) for item in fired if item][:MAX_FIRED]}
     path = reminders_file()
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    raw = json.dumps(data, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > MAX_REMINDER_BYTES:
+        data["fired"] = data["fired"][: max(0, len(data["fired"]) // 2)]
+        raw = json.dumps(data, separators=(",", ":"))
+        while len(raw.encode("utf-8")) > MAX_REMINDER_BYTES and data["fired"]:
+            data["fired"] = data["fired"][: max(0, len(data["fired"]) // 2)]
+            raw = json.dumps(data, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > MAX_REMINDER_BYTES:
+        return {"ok": False, "minutes": minutes, "fired": current["fired"], "error": {"code": "reminders-too-large", "message": "Reminder state was too large."}}
+    tmp.write_text(raw, encoding="utf-8")
     tmp.replace(path)
     return {"ok": True, "minutes": minutes, "fired": data["fired"]}
 
@@ -914,25 +1011,34 @@ def write_cache(payload: dict) -> None:
     data = {
         "ok": True,
         "provider": payload.get("provider") or "evolution-data-server",
-        "calendars": payload.get("calendars") or [],
-        "events": payload.get("events") or [],
+        "calendars": bound_items(payload.get("calendars"), MAX_CALENDARS),
+        "events": bound_items(payload.get("events"), MAX_EVENTS),
         "cachedAt": iso(datetime.now(UTC)),
         "range": payload.get("range") or {},
     }
-    tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    raw = json.dumps(data, separators=(",", ":"))
+    while len(raw.encode("utf-8")) > MAX_CACHE_BYTES and data["events"]:
+        data["events"] = data["events"][: max(0, len(data["events"]) // 2)]
+        raw = json.dumps(data, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > MAX_CACHE_BYTES:
+        return
+    tmp.write_text(raw, encoding="utf-8")
     tmp.replace(path)
 
 
 def read_cache() -> dict | None:
     path = cache_file()
-    if not path.is_file():
+    text = read_limited_text(path, MAX_CACHE_BYTES)
+    if text is None:
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(text)
     except Exception:
         return None
     if not isinstance(data, dict) or data.get("ok") is not True:
         return None
+    data["calendars"] = bound_items(data.get("calendars"), MAX_CALENDARS)
+    data["events"] = bound_items(data.get("events"), MAX_EVENTS)
     return data
 
 
@@ -962,8 +1068,8 @@ def cached_snapshot(start: datetime, end: datetime, provider: str) -> dict:
     return {
         "ok": True,
         "provider": cache.get("provider") or provider,
-        "calendars": cache.get("calendars") or [],
-        "events": cache.get("events") or [],
+        "calendars": bound_items(cache.get("calendars"), MAX_CALENDARS),
+        "events": bound_items(cache.get("events"), MAX_EVENTS),
         "cached": True,
         "cachedAt": cache.get("cachedAt") or "",
         "range": {"start": iso(start), "end": iso(end)},
@@ -1130,91 +1236,57 @@ def main(argv: list[str]) -> int:
             payload = cached_snapshot(start, end, args.provider)
             if args.operation == "list-calendars":
                 payload = {key: value for key, value in payload.items() if key != "events"}
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0 if payload.get("ok") else 1
+            return emit_json(payload)
         if args.operation == "ensure-center-anchor":
-            payload = ensure_center_anchor(args.title or "sirwizardlizard.calendar")
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(ensure_center_anchor(args.title or "sirwizardlizard.calendar"))
         if args.operation == "reminders-state":
-            payload = read_reminders()
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(read_reminders())
         if args.operation == "reminders-save":
-            raw = sys.stdin.readline()
-            payload = write_reminders(json.loads(raw or "{}"))
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            raw = read_stdin_limited(MAX_REMINDER_BYTES)
+            return emit_json(write_reminders(json.loads(raw or "{}")))
         if args.operation == "create-event":
             location = apply_meeting(args.meeting_kind, args.meeting_url, args.location)
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("create-event currently requires the evolution-data-server provider.")
-            payload = eds_create_event(args.calendar_id, args.title, start, end, args.all_day, location, args.description, normalize_rrule(args.rrule))
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(eds_create_event(args.calendar_id, args.title, start, end, args.all_day, location, args.description, normalize_rrule(args.rrule)))
         if args.operation == "update-event":
             location = apply_meeting(args.meeting_kind, args.meeting_url, args.location)
             dest = args.to_calendar_id or args.calendar_id
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("update-event currently requires the evolution-data-server provider.")
-            payload = eds_update_event(args.calendar_id, args.uid, args.rid, args.title, start, end, args.all_day, location, args.description, args.scope, dest)
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(eds_update_event(args.calendar_id, args.uid, args.rid, args.title, start, end, args.all_day, location, args.description, args.scope, dest))
         if args.operation == "delete-event":
             if not args.uid:
                 raise ValueError("delete-event requires --uid.")
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("delete-event currently requires the evolution-data-server provider.")
-            payload = eds_delete_event(args.calendar_id, args.uid, args.rid if args.scope != "all" else "")
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(eds_delete_event(args.calendar_id, args.uid, args.rid if args.scope != "all" else ""))
         if args.operation == "setup-caldav":
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("setup-caldav currently requires the evolution-data-server provider.")
-            raw = sys.stdin.readline()
-            payload = eds_setup_caldav(json.loads(raw or "{}"))
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            raw = read_stdin_limited(MAX_REMINDER_BYTES)
+            return emit_json(eds_setup_caldav(json.loads(raw or "{}")))
         if args.operation == "create-local-calendar":
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("create-local-calendar currently requires the evolution-data-server provider.")
-            payload = eds_create_local_calendar(args.title)
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(eds_create_local_calendar(args.title))
         if args.operation == "remove-calendar":
             if not args.calendar_id:
                 raise ValueError("remove-calendar requires --calendar-id.")
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("remove-calendar currently requires the evolution-data-server provider.")
-            payload = eds_remove_calendar(args.calendar_id)
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(eds_remove_calendar(args.calendar_id))
         if args.operation == "update-calendars":
-            raw = sys.stdin.readline()
-            items = (json.loads(raw or "{}") or {}).get("calendars") or []
+            raw = read_stdin_limited(MAX_REMINDER_BYTES)
+            items = bound_items((json.loads(raw or "{}") or {}).get("calendars") or [], MAX_CALENDARS)
             if args.provider in ("eds", "evolution-data-server"):
                 payload = eds_update_calendars(items)
             else:
                 apply_calendar_overrides_to_cache(items)
                 payload = {"ok": True, "provider": args.provider, "calendars": items}
-            json.dump(payload, sys.stdout, separators=(",", ":"))
-            sys.stdout.write("\n")
-            return 0
+            return emit_json(payload)
     except Exception as error:
-        payload = {"ok": False, "provider": args.provider, "error": {"code": "operation-failed", "message": str(error)}}
-        json.dump(payload, sys.stdout, separators=(",", ":"))
-        sys.stdout.write("\n")
-        return 1
+        return emit_json({"ok": False, "provider": args.provider, "error": {"code": "operation-failed", "message": str(error)}})
 
     if args.provider == "mock":
         payload = mock_snapshot(start, end)
@@ -1233,9 +1305,7 @@ def main(argv: list[str]) -> int:
     if args.operation == "list-calendars":
         payload = {key: value for key, value in payload.items() if key != "events"}
 
-    json.dump(payload, sys.stdout, separators=(",", ":"))
-    sys.stdout.write("\n")
-    return 0 if payload.get("ok") else 1
+    return emit_json(payload)
 
 
 if __name__ == "__main__":
