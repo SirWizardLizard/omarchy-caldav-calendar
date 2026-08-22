@@ -1,0 +1,1242 @@
+#!/usr/bin/env python3
+"""Provider-neutral calendar helper for the Omarchy calendar plugin.
+
+The first implementation exposes a stable JSON protocol and a mock provider.
+The Evolution Data Server adapter is intentionally isolated behind the same
+interface so the QML plugin does not know which account provider is backing a
+calendar source.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+
+def iso(value: datetime) -> str:
+    return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def iso_to_rid(stamp: str, all_day: bool) -> str:
+    text = str(stamp or "")
+    if all_day and len(text) >= 10:
+        return text[:10].replace("-", "")
+    if "T" in text:
+        date_part, time_part = text.split("T", 1)
+        digits = "".join(ch for ch in time_part if ch.isdigit())
+        suffix = "Z" if time_part.endswith("Z") else ""
+        return date_part.replace("-", "") + "T" + (digits + "000000")[:6] + suffix
+    return text.replace("-", "")
+
+
+def mock_snapshot(start: datetime, end: datetime) -> dict:
+    first = start.astimezone(UTC).replace(hour=15, minute=0, second=0, microsecond=0)
+    second = first + timedelta(days=2, hours=1)
+    calendars = [
+        {
+            "id": "personal",
+            "name": "Personal",
+            "color": "#8aadf4",
+            "provider": "mock",
+            "source": "Mock Calendar",
+        }
+    ]
+    events = [
+        {
+            "id": "mock-personal-sync-check",
+            "calendarId": "personal",
+            "calendarName": "Personal",
+            "calendarColor": "#8aadf4",
+            "title": "Calendar sync check",
+            "location": "Omarchy",
+            "description": "Mock event used while developing the provider-neutral UI.",
+            "start": iso(first),
+            "end": iso(first + timedelta(hours=1)),
+            "allDay": False,
+            "status": "confirmed",
+            "provider": "mock",
+            "source": "Mock Calendar",
+        },
+        {
+            "id": "mock-personal-planning",
+            "calendarId": "personal",
+            "calendarName": "Personal",
+            "calendarColor": "#8aadf4",
+            "title": "Plan the week",
+            "location": "",
+            "description": "Second mock event to exercise grouped day rendering.",
+            "start": iso(second),
+            "end": iso(second + timedelta(minutes=45)),
+            "allDay": False,
+            "status": "confirmed",
+            "provider": "mock",
+            "source": "Mock Calendar",
+        },
+    ]
+    return {"ok": True, "provider": "mock", "calendars": calendars, "events": events, "range": {"start": iso(start), "end": iso(end)}}
+
+
+@dataclass
+class EdsModules:
+    EDataServer: object
+    ECal: object
+    ICalGLib: object
+    GLib: object | None = None
+
+
+def load_eds_modules() -> EdsModules:
+    try:
+        import gi  # type: ignore
+    except Exception as error:  # pragma: no cover - depends on host packages
+        raise RuntimeError(f"Python GI bindings are not available: {error}") from error
+
+    gi.require_version("EDataServer", "1.2")
+    gi.require_version("ECal", "2.0")
+    gi.require_version("ICalGLib", "4.0")
+    from gi.repository import ECal, EDataServer, GLib, ICalGLib  # type: ignore
+
+    modules = EdsModules(EDataServer=EDataServer, ECal=ECal, ICalGLib=ICalGLib)
+    modules.GLib = GLib
+    return modules
+
+
+def source_provider(source, registry, modules: EdsModules) -> str:
+    eds = modules.EDataServer
+    if source.has_extension(eds.SOURCE_EXTENSION_GOA):
+        return "gnome-online-accounts"
+    if source.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
+        return "caldav"
+    if source.has_extension(eds.SOURCE_EXTENSION_LOCAL_BACKEND):
+        return "local"
+
+    parent_id = source.get_parent()
+    if parent_id:
+        parent = registry.ref_source(parent_id)
+        if parent:
+            if parent.has_extension(eds.SOURCE_EXTENSION_GOA):
+                return "gnome-online-accounts"
+            if parent.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
+                return "caldav"
+            if parent.has_extension(eds.SOURCE_EXTENSION_LOCAL_BACKEND):
+                return "local"
+
+    return "evolution-data-server"
+
+
+def source_host(source, modules: EdsModules) -> str:
+    eds = modules.EDataServer
+    if not source.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
+        return ""
+    uri = source.get_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND).dup_uri()
+    if uri is None:
+        return ""
+    return str(uri.get_host() or "")
+
+
+def source_calendar(source, registry, modules: EdsModules) -> dict:
+    color = ""
+    if source.has_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
+        extension = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+        color = extension.get_color() if extension and hasattr(extension, "get_color") else ""
+    return {
+        "id": source.get_uid(),
+        "name": source.get_display_name(),
+        "color": color or "",
+        "provider": source_provider(source, registry, modules),
+        "host": source_host(source, modules),
+        "source": "Evolution Data Server",
+        "readonly": None,
+    }
+
+
+def text_value(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "get_value"):
+        return str(value.get_value() or "")
+    return str(value or "")
+
+
+def resolve_ical_timezone(modules: EdsModules, tzid: str, client=None):
+    name = str(tzid or "").strip()
+    if not name:
+        return None
+    timezone = modules.ICalGLib.Timezone.get_builtin_timezone(name)
+    if timezone is not None:
+        return timezone
+    timezone = modules.ICalGLib.Timezone.get_builtin_timezone_from_tzid(name)
+    if timezone is not None:
+        return timezone
+    if client is not None and hasattr(client, "get_timezone_sync"):
+        try:
+            ok, timezone = client.get_timezone_sync(name, None)
+            if ok:
+                return timezone
+        except Exception:
+            return None
+    return None
+
+
+def ical_value_to_iso(value, tzid: str, modules: EdsModules | None = None, client=None) -> tuple[str, bool]:
+    if value is None or (hasattr(value, "is_null_time") and value.is_null_time()):
+        return "", False
+    if hasattr(value, "is_date") and value.is_date():
+        return f"{value.get_year():04d}-{value.get_month():02d}-{value.get_day():02d}", True
+    zone_name = str(tzid or (value.get_tzid() if hasattr(value, "get_tzid") else "") or "")
+    if hasattr(value, "is_utc") and value.is_utc():
+        return iso(datetime.fromtimestamp(value.as_timet(), UTC)), False
+    zone = resolve_ical_timezone(modules, zone_name, client) if modules is not None else None
+    if zone is not None and hasattr(value, "as_timet_with_zone"):
+        return iso(datetime.fromtimestamp(value.as_timet_with_zone(zone), UTC)), False
+    if zone_name:
+        local = datetime(value.get_year(), value.get_month(), value.get_day(), value.get_hour(), value.get_minute(), value.get_second())
+        return iso(local.astimezone().astimezone(UTC)), False
+    return iso(datetime.fromtimestamp(value.as_timet(), UTC)), False
+
+
+def component_datetime(component_dt, modules: EdsModules | None = None, client=None) -> tuple[str, bool, str]:
+    if component_dt is None:
+        return "", False, ""
+    value = component_dt.get_value()
+    tzid = component_dt.get_tzid() or (value.get_tzid() if value is not None and hasattr(value, "get_tzid") else "") or ""
+    if value is None or value.is_null_time():
+        return "", False, tzid
+    stamp, all_day = ical_value_to_iso(value, tzid, modules, client)
+    return stamp, all_day, tzid
+
+
+def ical_time_iso(value, modules: EdsModules | None = None, client=None) -> tuple[str, bool]:
+    tzid = value.get_tzid() if value is not None and hasattr(value, "get_tzid") else ""
+    return ical_value_to_iso(value, tzid, modules, client)
+
+
+def append_component_events(client, component, calendar: dict, window_start: datetime, window_end: datetime, events: list, modules: EdsModules | None = None) -> None:
+    base = component_event(component, calendar, modules, client)
+    if not base["id"] or not base["start"]:
+        return
+    if not hasattr(component, "has_recurrences") or not component.has_recurrences():
+        events.append(base)
+        return
+    ical = component.get_icalcomponent() if hasattr(component, "get_icalcomponent") else None
+    if ical is None:
+        events.append(base)
+        return
+    collected = []
+
+    def cb(_icomp, instance_start, instance_end, _user_data, _cancellable=None):
+        start, all_day = ical_time_iso(instance_start, modules, client)
+        end, end_all_day = ical_time_iso(instance_end, modules, client)
+        if not start:
+            return True
+        event = dict(base)
+        event["start"] = start
+        event["end"] = end or start
+        event["allDay"] = bool(event["allDay"] or all_day or end_all_day)
+        event["rid"] = iso_to_rid(start, event["allDay"])
+        event["recurring"] = True
+        event["id"] = ":".join(part for part in [event["calendarId"], event["uid"], event["rid"] or start] if part)
+        collected.append(event)
+        return True
+
+    try:
+        client.generate_instances_for_object_sync(
+            ical,
+            int(window_start.timestamp()),
+            int(window_end.timestamp()),
+            None,
+            cb,
+            None,
+        )
+    except Exception:
+        events.append(base)
+        return
+    events.extend(collected)
+
+
+def normalize_meeting_url(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    return raw if re.match(r"https?://", raw, re.I) else "https://" + raw.lstrip("/")
+
+
+def meeting_from_text(text: str) -> tuple[str, str]:
+    blob = str(text or "")
+    patterns = (
+        ("zoom", r"(?:https?://)?(?:[\w.-]+\.)?zoom\.us/[^\s<>\"']+"),
+        ("meet", r"(?:https?://)?meet\.google\.com/[^\s<>\"']+"),
+        ("teams", r"(?:https?://)?teams\.(?:microsoft|live)\.com/[^\s<>\"']+"),
+    )
+    for provider, pattern in patterns:
+        found = re.search(pattern, blob, re.I)
+        if found:
+            return normalize_meeting_url(found.group(0).rstrip(".,);")), provider
+    return "", ""
+
+
+def component_event(component, calendar: dict, modules: EdsModules | None = None, client=None) -> dict:
+    uid = component.get_uid() or ""
+    rid = component.get_recurid_as_string() or ""
+    start, all_day, timezone = component_datetime(component.get_dtstart(), modules, client)
+    end, end_all_day, end_timezone = component_datetime(component.get_dtend(), modules, client)
+    descriptions = component.get_descriptions() or []
+    description = text_value(descriptions[0]) if descriptions else ""
+    status = str(component.get_status() or "").lower()
+    ical = component.get_icalcomponent() if hasattr(component, "get_icalcomponent") else None
+    conference = ical.as_ical_string() if ical is not None and hasattr(ical, "as_ical_string") else ""
+    meeting_url, meeting_provider = meeting_from_text("\n".join([component.get_location() or "", description, conference]))
+    return {
+        "id": ":".join(part for part in [calendar["id"], uid, rid] if part),
+        "uid": uid,
+        "rid": rid,
+        "calendarId": calendar["id"],
+        "calendarName": calendar["name"],
+        "calendarColor": calendar["color"],
+        "title": text_value(component.get_summary()) or "(No title)",
+        "location": component.get_location() or "",
+        "description": description,
+        "start": start,
+        "end": end or start,
+        "allDay": all_day or end_all_day,
+        "timezone": timezone or end_timezone,
+        "status": status,
+        "meetingUrl": meeting_url,
+        "meetingProvider": meeting_provider,
+        "recurring": bool(hasattr(component, "has_recurrences") and component.has_recurrences()),
+        "provider": calendar["provider"],
+        "source": calendar["source"],
+    }
+
+
+def webdav_resource_path(source, modules: EdsModules) -> str:
+    eds = modules.EDataServer
+    if not source.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
+        return "/"
+    uri = source.get_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND).dup_uri()
+    if uri is None:
+        return "/"
+    return uri.get_path() or "/"
+
+
+def is_unresolved_caldav_root(source, registry, modules: EdsModules) -> bool:
+    if source_provider(source, registry, modules) != "caldav":
+        return False
+    path = webdav_resource_path(source, modules).rstrip("/") or "/"
+    return path == "/"
+
+
+def eds_range_query(start: datetime, end: datetime) -> str:
+    def stamp(value: datetime) -> str:
+        return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+    return f'(occur-in-time-range? (make-time "{stamp(start)}") (make-time "{stamp(end)}"))'
+
+
+def ics_escape(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def ics_datetime(value: datetime, all_day: bool) -> str:
+    if all_day:
+        return value.astimezone(UTC).strftime("%Y%m%d")
+    return value.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def source_for_calendar(registry, calendar_id: str, modules: EdsModules):
+    if calendar_id:
+        source = registry.ref_source(calendar_id)
+        if source and source.has_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
+            return source
+        raise ValueError(f"Calendar not found: {calendar_id}")
+
+    for source in registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
+        if registry.check_enabled(source):
+            extension = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+            if extension and hasattr(extension, "get_selected") and extension.get_selected():
+                return source
+
+    for source in registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
+        if registry.check_enabled(source):
+            return source
+
+    raise ValueError("No enabled calendars found.")
+
+
+def eds_client_for_calendar(calendar_id: str):
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    source = source_for_calendar(registry, calendar_id, modules)
+    client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 8, None)
+    return modules, registry, source, client
+
+
+def rrule_for_repeat(repeat: str) -> str:
+    mapping = {
+        "daily": "FREQ=DAILY",
+        "weekday": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "weekdays": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+        "weekly": "FREQ=WEEKLY",
+        "monthly": "FREQ=MONTHLY",
+        "yearly": "FREQ=YEARLY",
+    }
+    return mapping.get(str(repeat or "").strip().lower(), "")
+
+
+def normalize_rrule(value: str) -> str:
+    text = str(value or "").strip()
+    if text.upper().startswith("RRULE:"):
+        text = text[6:].strip()
+    mapped = rrule_for_repeat(text)
+    if mapped:
+        return mapped
+    if not text or text.lower() in ("never", "none"):
+        return ""
+    parts = {}
+    for item in text.split(";"):
+        if "=" not in item:
+            continue
+        key, raw = item.split("=", 1)
+        parts[key.strip().upper()] = raw.strip()
+    freq = parts.get("FREQ", "").upper()
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        return ""
+    ordered = [f"FREQ={freq}"]
+    if parts.get("INTERVAL") and parts["INTERVAL"] != "1":
+        ordered.append(f"INTERVAL={parts['INTERVAL']}")
+    for key in ("BYMONTH", "BYMONTHDAY", "BYDAY", "BYSETPOS", "COUNT", "UNTIL"):
+        if key in parts:
+            ordered.append(f"{key}={parts[key].upper() if key == 'BYDAY' else parts[key]}")
+    return ";".join(ordered)
+
+
+def event_component_from_fields(modules: EdsModules, uid: str, title: str, start: datetime, end: datetime, all_day: bool, location: str, description: str, rrule: str = ""):
+    now = datetime.now(UTC)
+    lines = [
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{ics_datetime(now, False)}",
+        f"CREATED:{ics_datetime(now, False)}",
+        f"LAST-MODIFIED:{ics_datetime(now, False)}",
+        f"SUMMARY:{ics_escape(title or '(No title)')}",
+    ]
+    if all_day:
+        lines.append(f"DTSTART;VALUE=DATE:{ics_datetime(start, True)}")
+        lines.append(f"DTEND;VALUE=DATE:{ics_datetime(end, True)}")
+    else:
+        lines.append(f"DTSTART:{ics_datetime(start, False)}")
+        lines.append(f"DTEND:{ics_datetime(end, False)}")
+    if location:
+        lines.append(f"LOCATION:{ics_escape(location)}")
+    if description:
+        lines.append(f"DESCRIPTION:{ics_escape(description)}")
+    if rrule:
+        lines.append(f"RRULE:{rrule}")
+    lines.append("END:VEVENT")
+    ical = modules.ICalGLib.Component.new_from_string("\r\n".join(lines) + "\r\n")
+    if not ical:
+        raise ValueError("Failed to build iCalendar event.")
+    return ical
+
+
+def eds_create_event(calendar_id: str, title: str, start: datetime, end: datetime, all_day: bool, location: str, description: str, rrule: str = "") -> dict:
+    modules, registry, source, client = eds_client_for_calendar(calendar_id)
+    if client.is_readonly():
+        raise ValueError(f"Calendar is read-only: {source.get_display_name()}")
+
+    uid = f"omarchy-calendar-{uuid4()}"
+    ical = event_component_from_fields(modules, uid, title, start, end, all_day, location, description, rrule)
+    ok, created_uid = client.create_object_sync(ical, modules.ECal.OperationFlags.DISABLE_ITIP_MESSAGE, None)
+    if not ok:
+        raise ValueError("EDS create_object_sync returned false.")
+    calendar = source_calendar(source, registry, modules)
+    calendar["readonly"] = False
+    component = modules.ECal.Component.new_from_icalcomponent(ical.clone())
+    event = component_event(component, calendar)
+    merge_cache_event(event)
+    return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "event": event, "uid": created_uid or uid}
+
+
+def apply_meeting(kind: str, url: str, location: str) -> str:
+    kind = str(kind or "none").strip().lower()
+    if kind in ("", "none"):
+        return location
+    found, _provider = meeting_from_text(url or location)
+    if kind in ("link", "meet", "zoom", "teams") and not found:
+        raise ValueError("Paste a Zoom, Google Meet, or Teams link.")
+    if found and found not in str(location or ""):
+        return f"{location} · {found}" if location else found
+    return location
+
+
+def extract_rrule(component) -> str:
+    ical = component.get_icalcomponent() if hasattr(component, "get_icalcomponent") else component
+    text = ical.as_ical_string() if ical is not None and hasattr(ical, "as_ical_string") else ""
+    for raw in str(text).replace("\r\n ", "").replace("\n ", "").splitlines():
+        line = raw.strip()
+        if line.upper().startswith("RRULE:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def eds_update_event(calendar_id: str, uid: str, rid: str, title: str, start: datetime, end: datetime, all_day: bool, location: str, description: str, scope: str = "", to_calendar_id: str = "") -> dict:
+    if not uid:
+        raise ValueError("update-event requires --uid.")
+    modules, registry, source, client = eds_client_for_calendar(calendar_id)
+    if client.is_readonly():
+        raise ValueError(f"Calendar is read-only: {source.get_display_name()}")
+
+    ok, existing = client.get_object_sync(uid, None, None)
+    if not ok or existing is None:
+        raise ValueError(f"Event not found: {uid}")
+
+    dest_id = str(to_calendar_id or "").strip()
+    if dest_id and dest_id != calendar_id:
+        rrule = "" if (scope == "this" and rid) else extract_rrule(existing)
+        payload = eds_create_event(dest_id, title, start, end, all_day, location, description, rrule)
+        eds_delete_event(calendar_id, uid, rid if scope == "this" and rid else "")
+        return payload
+
+    keep_date = scope == "all"
+    mod = modules.ECal.ObjModType.THIS if scope == "this" and rid else modules.ECal.ObjModType.ALL
+    old_start = existing.get_dtstart()
+    old_end = existing.get_dtend()
+    tzid = old_start.get_tzid() if old_start else ""
+    zone = resolve_ical_timezone(modules, tzid, client)
+    utc_zone = modules.ICalGLib.Timezone.get_utc_timezone()
+
+    def to_ical(dt, template):
+        stamp = modules.ICalGLib.Time.new_from_timet_with_zone(int(dt.timestamp()), 0, utc_zone)
+        if zone is not None:
+            stamp = stamp.convert_to_zone(zone)
+            stamp.set_timezone(zone)
+        if keep_date and template is not None and not template.is_date():
+            stamp.set_year(template.get_year())
+            stamp.set_month(template.get_month())
+            stamp.set_day(template.get_day())
+        return stamp
+
+    existing.set_summary(title or "(No title)")
+    if hasattr(existing, "set_location"):
+        existing.set_location(location or "")
+    if all_day:
+        def to_date(dt):
+            stamp = modules.ICalGLib.Time.new_from_string(dt.strftime("%Y%m%d"))
+            if stamp is not None and hasattr(stamp, "set_is_date"):
+                stamp.set_is_date(1)
+            return stamp
+
+        existing.set_dtstart(to_date(start))
+        existing.set_dtend(to_date(end))
+    else:
+        existing.set_dtstart(to_ical(start, old_start))
+        existing.set_dtend(to_ical(end, old_end))
+    ok = client.modify_object_sync(existing, mod, modules.ECal.OperationFlags.DISABLE_ITIP_MESSAGE, None)
+    if not ok:
+        raise ValueError("EDS modify_object_sync returned false.")
+    calendar = source_calendar(source, registry, modules)
+    calendar["readonly"] = False
+    component = modules.ECal.Component.new_from_icalcomponent(existing.clone())
+    event = component_event(component, calendar, modules, client)
+    merge_cache_event(event)
+    return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "event": event, "uid": uid, "rid": rid}
+
+
+def eds_delete_event(calendar_id: str, uid: str, rid: str = "") -> dict:
+    modules, registry, source, client = eds_client_for_calendar(calendar_id)
+    if client.is_readonly():
+        raise ValueError(f"Calendar is read-only: {source.get_display_name()}")
+    mod = modules.ECal.ObjModType.THIS if rid else modules.ECal.ObjModType.ALL
+    ok = client.remove_object_sync(uid, rid or None, mod, modules.ECal.OperationFlags.DISABLE_ITIP_MESSAGE, None)
+    if not ok:
+        raise ValueError("EDS remove_object_sync returned false.")
+    if rid:
+        remove_cache_event(":".join(part for part in [source.get_uid(), uid, rid] if part))
+    else:
+        cache = read_cache()
+        if cache:
+            cache["events"] = [event for event in (cache.get("events") or []) if event.get("uid") != uid or event.get("calendarId") != source.get_uid()]
+            write_cache(cache)
+    return {"ok": True, "provider": "evolution-data-server", "calendarId": source.get_uid(), "uid": uid, "rid": rid}
+
+
+def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, credentials, username: str, host: str, port: int, committed: list | None = None) -> list:
+    result = modules.EDataServer.webdav_discover_sources_sync(
+        parent,
+        None,
+        modules.EDataServer.WebDAVDiscoverSupports.EVENTS,
+        credentials,
+        None,
+    )
+    discovered = []
+    if isinstance(result, tuple):
+        ok = result[0]
+        sources = result[3] if len(result) > 3 else []
+        if not ok:
+            raise ValueError("Could not discover calendars on that CalDAV server.")
+        discovered = list(sources or [])
+    elif result:
+        discovered = list(result)
+
+    calendars = []
+    event_flag = int(modules.EDataServer.WebDAVDiscoverSupports.EVENTS)
+    for item in discovered:
+        supports = int(getattr(item, "supports", 0) or 0)
+        href = str(getattr(item, "href", "") or "").strip()
+        if not href or (supports and (supports & event_flag) == 0):
+            continue
+        child = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-caldav-{uuid4()}", None)
+        child.set_display_name(str(getattr(item, "display_name", "") or parent.get_display_name() or "Calendar"))
+        child.set_enabled(True)
+
+        calendar = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+        calendar.set_backend_name("caldav")
+        calendar.set_selected(True)
+        color = str(getattr(item, "color", "") or "")
+        if color:
+            calendar.set_color(color)
+
+        uri = modules.GLib.Uri.parse(href, modules.GLib.UriFlags.NONE)
+        webdav = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
+        webdav.set_uri(uri)
+        webdav.set_display_name(child.get_display_name())
+        if color:
+            webdav.set_color(color)
+        webdav.set_calendar_auto_schedule(True)
+
+        child_host = uri.get_host() or host
+        child_port = uri.get_port()
+        if child_port < 0:
+            child_port = 443 if (uri.get_scheme() or "https") == "https" else port
+        auth = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
+        auth.set_host(child_host)
+        auth.set_port(child_port)
+        auth.set_user(username)
+        auth.set_method("plain/password")
+        auth.set_remember_password(True)
+
+        if not registry.commit_source_sync(child, None):
+            raise ValueError("Failed to save a discovered calendar source.")
+        if committed is not None:
+            committed.append(child)
+        cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
+        if cred_provider.can_store(child):
+            cred_provider.store_sync(child, credentials, True, None)
+        try:
+            client = modules.ECal.Client.connect_sync(child, modules.ECal.ClientSourceType.EVENTS, 15, None)
+            if hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
+                client.refresh_sync(None)
+        except Exception as error:
+            raise ValueError(f"Added {child.get_display_name()}, but the first sync failed: {error}") from error
+        calendars.append(source_calendar(child, registry, modules))
+
+    if not calendars:
+        raise ValueError("Connected, but no calendars were found on that CalDAV server.")
+    return calendars
+
+
+def eds_setup_caldav(payload: dict) -> dict:
+    display_name = str(payload.get("displayName") or "Calendar").strip()
+    url = str(payload.get("url") or "").strip()
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not url:
+        raise ValueError("CalDAV URL is required.")
+    if not username:
+        raise ValueError("Username is required.")
+    if not password:
+        raise ValueError("Password is required.")
+    if any(character.isspace() for character in url):
+        raise ValueError("CalDAV URL cannot contain spaces.")
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError("CalDAV URL must include http(s) scheme and host.")
+    if any(character.isspace() for character in parsed.hostname):
+        raise ValueError("CalDAV URL host cannot contain spaces.")
+
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    uri = modules.GLib.Uri.parse(url, modules.GLib.UriFlags.NONE)
+    host = uri.get_host() or ""
+    port = uri.get_port()
+    if port < 0:
+        port = 443 if uri.get_scheme() == "https" else 80
+    if not host:
+        raise ValueError("CalDAV URL must include a host.")
+
+    source = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-caldav-{uuid4()}", None)
+    source.set_display_name(display_name)
+    source.set_enabled(True)
+
+    collection = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_COLLECTION)
+    collection.set_backend_name("webdav")
+    collection.set_identity(username)
+    collection.set_calendar_enabled(True)
+    collection.set_contacts_enabled(False)
+    collection.set_mail_enabled(False)
+    if hasattr(collection, "set_calendar_url"):
+        collection.set_calendar_url(url)
+
+    webdav = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
+    webdav.set_uri(uri)
+    webdav.set_display_name(display_name)
+    webdav.set_color("#8aadf4")
+    webdav.set_calendar_auto_schedule(True)
+
+    auth = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
+    auth.set_host(host)
+    auth.set_port(port)
+    auth.set_user(username)
+    auth.set_method("plain/password")
+    auth.set_remember_password(True)
+    auth.set_credential_name("CalDAV")
+
+    offline = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_OFFLINE)
+    offline.set_stay_synchronized(True)
+
+    refresh = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_REFRESH)
+    refresh.set_enabled(True)
+    refresh.set_interval_minutes(15)
+
+    committed = []
+    try:
+        if not registry.commit_source_sync(source, None):
+            raise ValueError("Failed to commit EDS CalDAV source.")
+        committed.append(source)
+
+        credentials = modules.EDataServer.NamedParameters.new()
+        credentials.set(modules.EDataServer.SOURCE_CREDENTIAL_USERNAME, username)
+        credentials.set(modules.EDataServer.SOURCE_CREDENTIAL_PASSWORD, password)
+        provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
+        if not provider.can_store(source):
+            raise ValueError("Evolution Data Server cannot store credentials for this source.")
+        provider.store_sync(source, credentials, True, None)
+
+        calendars = eds_attach_discovered_calendars(modules, registry, source, credentials, username, host, port, committed)
+    except Exception:
+        for created in reversed(committed):
+            if hasattr(created, "remove_sync"):
+                created.remove_sync(None)
+        raise
+
+    return {
+        "ok": True,
+        "provider": "evolution-data-server",
+        "calendar": source_calendar(source, registry, modules),
+        "calendars": calendars,
+    }
+
+
+def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) -> dict:
+    try:
+        modules = load_eds_modules()
+        registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    except Exception as error:  # pragma: no cover - depends on host packages
+        return {
+            "ok": False,
+            "provider": "evolution-data-server",
+            "calendars": [],
+            "events": [],
+            "error": {
+                "code": "eds-bindings-missing",
+                "message": "Evolution Data Server bindings are not available.",
+                "detail": str(error),
+            },
+        }
+
+    calendars = []
+    events = []
+    errors = []
+    sources = registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+    window_start = min(start, datetime.now(UTC) - timedelta(days=400))
+    window_end = max(end, datetime.now(UTC) + timedelta(days=400))
+    query = eds_range_query(window_start, window_end)
+
+    for source in sources:
+        if not registry.check_enabled(source):
+            continue
+        if is_unresolved_caldav_root(source, registry, modules):
+            continue
+        calendar = source_calendar(source, registry, modules)
+        try:
+            client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 3, None)
+            calendar["readonly"] = bool(client.is_readonly())
+            calendars.append(calendar)
+            if not include_events:
+                continue
+            ok, components = client.get_object_list_as_comps_sync(query, None)
+            if not ok:
+                errors.append({"calendarId": calendar["id"], "code": "query-failed", "message": "EDS query returned false."})
+                continue
+            for component in components or []:
+                append_component_events(client, component, calendar, window_start, window_end, events, modules)
+        except Exception as error:
+            errors.append({"calendarId": calendar["id"], "code": "calendar-error", "message": str(error)})
+
+    payload = {
+        "ok": True,
+        "provider": "evolution-data-server",
+        "calendars": calendars,
+        "events": events,
+        "cached": False,
+        "range": {"start": iso(window_start), "end": iso(window_end)},
+    }
+    if errors:
+        payload["warnings"] = errors
+    if include_events:
+        write_cache(payload)
+    return payload
+
+
+def parse_instant(value: str) -> datetime:
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def parse_event_instant(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) >= 10 and text[4] == "-" and "T" not in text[:11]:
+            return datetime.fromisoformat(text[:10] + "T00:00:00+00:00").astimezone(UTC)
+        return parse_instant(text)
+    except Exception:
+        return None
+
+
+def cache_dir() -> Path:
+    override = os.environ.get("OMARCHY_CALENDAR_CACHE")
+    path = Path(override) if override else Path.home() / ".local/share/omarchy-calendar"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def cache_file() -> Path:
+    return cache_dir() / "cache.json"
+
+
+def shell_config_path() -> Path:
+    override = os.environ.get("OMARCHY_SHELL_CONFIG")
+    return Path(override) if override else Path.home() / ".config/omarchy/shell.json"
+
+
+def ensure_center_anchor(plugin_id: str) -> dict:
+    plugin_id = str(plugin_id or "").strip()
+    path = shell_config_path()
+    if not plugin_id or not path.is_file():
+        return {"ok": True, "changed": False}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": True, "changed": False}
+    bar = data.get("bar") if isinstance(data, dict) else None
+    if not isinstance(bar, dict):
+        return {"ok": True, "changed": False}
+    if str(bar.get("centerAnchor") or "") != "omarchy.clock":
+        return {"ok": True, "changed": False, "centerAnchor": str(bar.get("centerAnchor") or "")}
+    center = ((bar.get("layout") or {}).get("center") or [])
+    ids = [str(entry.get("id") or "") if isinstance(entry, dict) else str(entry) for entry in center]
+    if plugin_id not in ids:
+        return {"ok": True, "changed": False, "centerAnchor": "omarchy.clock"}
+    text = path.read_text(encoding="utf-8")
+    updated = text.replace('"centerAnchor": "omarchy.clock"', f'"centerAnchor": "{plugin_id}"', 1)
+    if updated == text:
+        bar["centerAnchor"] = plugin_id
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    else:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(updated, encoding="utf-8")
+        tmp.replace(path)
+    return {"ok": True, "changed": True, "centerAnchor": plugin_id}
+
+
+def reminders_file() -> Path:
+    return cache_dir() / "reminders.json"
+
+
+def read_reminders() -> dict:
+    try:
+        data = json.loads(reminders_file().read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    minutes = data.get("minutes")
+    try:
+        minutes = int(minutes)
+    except Exception:
+        minutes = 10
+    if minutes not in (0, 5, 10, 15, 30):
+        minutes = 10
+    fired = data.get("fired") or []
+    if not isinstance(fired, list):
+        fired = []
+    return {"ok": True, "minutes": minutes, "fired": [str(item) for item in fired if item]}
+
+
+def write_reminders(payload: dict) -> dict:
+    current = read_reminders()
+    minutes = payload.get("minutes", current["minutes"])
+    try:
+        minutes = int(minutes)
+    except Exception:
+        minutes = current["minutes"]
+    if minutes not in (0, 5, 10, 15, 30):
+        minutes = current["minutes"]
+    fired = payload.get("fired")
+    if not isinstance(fired, list):
+        fired = current["fired"]
+    data = {"minutes": minutes, "fired": [str(item) for item in fired if item]}
+    path = reminders_file()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+    return {"ok": True, "minutes": minutes, "fired": data["fired"]}
+
+
+def write_cache(payload: dict) -> None:
+    path = cache_file()
+    tmp = path.with_suffix(".json.tmp")
+    data = {
+        "ok": True,
+        "provider": payload.get("provider") or "evolution-data-server",
+        "calendars": payload.get("calendars") or [],
+        "events": payload.get("events") or [],
+        "cachedAt": iso(datetime.now(UTC)),
+        "range": payload.get("range") or {},
+    }
+    tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_cache() -> dict | None:
+    path = cache_file()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None
+    return data
+
+
+def filter_events(events, start: datetime, end: datetime) -> list:
+    result = []
+    for event in events or []:
+        event_start = parse_event_instant((event or {}).get("start"))
+        if event_start is None:
+            continue
+        event_end = parse_event_instant((event or {}).get("end")) or event_start
+        if event_start < end and event_end >= start:
+            result.append(event)
+    return result
+
+
+def cached_snapshot(start: datetime, end: datetime, provider: str) -> dict:
+    cache = read_cache()
+    if not cache:
+        return {
+            "ok": False,
+            "provider": provider,
+            "calendars": [],
+            "events": [],
+            "cached": True,
+            "error": {"code": "no-cache", "message": "No local calendar cache yet."},
+        }
+    return {
+        "ok": True,
+        "provider": cache.get("provider") or provider,
+        "calendars": cache.get("calendars") or [],
+        "events": cache.get("events") or [],
+        "cached": True,
+        "cachedAt": cache.get("cachedAt") or "",
+        "range": {"start": iso(start), "end": iso(end)},
+    }
+
+
+def merge_cache_event(event: dict) -> None:
+    if not event or not event.get("id"):
+        return
+    cache = read_cache() or {"ok": True, "provider": "evolution-data-server", "calendars": [], "events": []}
+    events = [existing for existing in (cache.get("events") or []) if existing.get("id") != event.get("id")]
+    events.append(event)
+    cache["events"] = events
+    write_cache(cache)
+
+
+def apply_calendar_overrides_to_cache(updates: list) -> None:
+    cache = read_cache()
+    if not cache:
+        return
+    by_id = {str(item.get("id") or ""): item for item in updates if item and item.get("id")}
+    if not by_id:
+        return
+    for calendar in cache.get("calendars") or []:
+        item = by_id.get(str(calendar.get("id") or ""))
+        if not item:
+            continue
+        name = str(item.get("name") or "").strip()
+        color = str(item.get("color") or "").strip()
+        if name:
+            calendar["name"] = name
+        if color:
+            calendar["color"] = color
+    for event in cache.get("events") or []:
+        item = by_id.get(str(event.get("calendarId") or ""))
+        if not item:
+            continue
+        name = str(item.get("name") or "").strip()
+        color = str(item.get("color") or "").strip()
+        if name:
+            event["calendarName"] = name
+        if color:
+            event["calendarColor"] = color
+    write_cache(cache)
+
+
+def eds_update_calendars(items: list) -> dict:
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    updated = []
+    for item in items or []:
+        calendar_id = str((item or {}).get("id") or "").strip()
+        if not calendar_id:
+            continue
+        source = registry.ref_source(calendar_id)
+        if source is None:
+            continue
+        name = str(item.get("name") or "").strip()
+        color = str(item.get("color") or "").strip()
+        if name:
+            source.set_display_name(name)
+        if color.startswith("#") and source.has_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
+            source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR).set_color(color)
+            if source.has_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND):
+                source.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND).set_color(color)
+        if not registry.commit_source_sync(source, None):
+            raise ValueError(f"Failed to update calendar: {source.get_display_name()}")
+        updated.append(source_calendar(source, registry, modules))
+    apply_calendar_overrides_to_cache(items or [])
+    return {"ok": True, "provider": "evolution-data-server", "calendars": updated}
+
+
+def remove_calendar_from_cache(calendar_id: str) -> None:
+    cache = read_cache()
+    if not cache or not calendar_id:
+        return
+    cache["calendars"] = [calendar for calendar in (cache.get("calendars") or []) if calendar.get("id") != calendar_id]
+    cache["events"] = [event for event in (cache.get("events") or []) if event.get("calendarId") != calendar_id]
+    write_cache(cache)
+
+
+def eds_create_local_calendar(display_name: str) -> dict:
+    name = str(display_name or "").strip() or "Calendar"
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    source = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-local-{uuid4()}", None)
+    if registry.ref_source("local-stub"):
+        source.set_parent("local-stub")
+    source.set_display_name(name)
+    source.set_enabled(True)
+    calendar = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+    calendar.set_backend_name("local")
+    if hasattr(calendar, "set_selected"):
+        calendar.set_selected(True)
+    if not registry.commit_source_sync(source, None):
+        raise ValueError("Failed to create a local calendar.")
+    created = source_calendar(source, registry, modules)
+    created["readonly"] = False
+    cache = read_cache()
+    if cache:
+        calendars = [item for item in (cache.get("calendars") or []) if item.get("id") != created["id"]]
+        calendars.append(created)
+        cache["calendars"] = calendars
+        write_cache(cache)
+    return {"ok": True, "provider": "evolution-data-server", "calendar": created}
+
+
+def eds_remove_calendar(calendar_id: str) -> dict:
+    calendar_id = str(calendar_id or "").strip()
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    source = registry.ref_source(calendar_id)
+    if source is None:
+        raise ValueError("Calendar not found.")
+    removed = False
+    if hasattr(source, "remove_sync"):
+        try:
+            source.remove_sync(None)
+            removed = True
+        except Exception:
+            removed = False
+    if not removed:
+        source.set_enabled(False)
+        if not registry.commit_source_sync(source, None):
+            raise ValueError("Unable to remove this calendar source.")
+    remove_calendar_from_cache(calendar_id)
+    return {"ok": True, "provider": "evolution-data-server", "calendarId": calendar_id}
+
+
+def remove_cache_event(event_id: str) -> None:
+    cache = read_cache()
+    if not cache or not event_id:
+        return
+    cache["events"] = [existing for existing in (cache.get("events") or []) if existing.get("id") != event_id]
+    write_cache(cache)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Return normalized calendar data as JSON")
+    parser.add_argument("operation", choices=["snapshot", "list-calendars", "create-event", "update-event", "delete-event", "setup-caldav", "create-local-calendar", "update-calendars", "remove-calendar", "reminders-state", "reminders-save", "ensure-center-anchor"])
+    parser.add_argument("--provider", default=os.environ.get("OMARCHY_CALENDAR_PROVIDER", "mock"))
+    parser.add_argument("--from", dest="start", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)))
+    parser.add_argument("--to", dest="end", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=31)))
+    parser.add_argument("--calendar-id", default="")
+    parser.add_argument("--to-calendar-id", default="")
+    parser.add_argument("--title", default="")
+    parser.add_argument("--location", default="")
+    parser.add_argument("--description", default="")
+    parser.add_argument("--all-day", action="store_true")
+    parser.add_argument("--uid", default="")
+    parser.add_argument("--rid", default="")
+    parser.add_argument("--scope", default="")
+    parser.add_argument("--rrule", default="")
+    parser.add_argument("--meeting-url", default="")
+    parser.add_argument("--meeting-kind", default="none")
+    parser.add_argument("--from-cache", action="store_true")
+    args = parser.parse_args(argv)
+
+    start = parse_instant(args.start)
+    end = parse_instant(args.end)
+
+    try:
+        if args.from_cache and args.operation in ("snapshot", "list-calendars"):
+            payload = cached_snapshot(start, end, args.provider)
+            if args.operation == "list-calendars":
+                payload = {key: value for key, value in payload.items() if key != "events"}
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0 if payload.get("ok") else 1
+        if args.operation == "ensure-center-anchor":
+            payload = ensure_center_anchor(args.title or "sirwizardlizard.calendar")
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "reminders-state":
+            payload = read_reminders()
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "reminders-save":
+            raw = sys.stdin.readline()
+            payload = write_reminders(json.loads(raw or "{}"))
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "create-event":
+            location = apply_meeting(args.meeting_kind, args.meeting_url, args.location)
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("create-event currently requires the evolution-data-server provider.")
+            payload = eds_create_event(args.calendar_id, args.title, start, end, args.all_day, location, args.description, normalize_rrule(args.rrule))
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "update-event":
+            location = apply_meeting(args.meeting_kind, args.meeting_url, args.location)
+            dest = args.to_calendar_id or args.calendar_id
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("update-event currently requires the evolution-data-server provider.")
+            payload = eds_update_event(args.calendar_id, args.uid, args.rid, args.title, start, end, args.all_day, location, args.description, args.scope, dest)
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "delete-event":
+            if not args.uid:
+                raise ValueError("delete-event requires --uid.")
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("delete-event currently requires the evolution-data-server provider.")
+            payload = eds_delete_event(args.calendar_id, args.uid, args.rid if args.scope != "all" else "")
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "setup-caldav":
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("setup-caldav currently requires the evolution-data-server provider.")
+            raw = sys.stdin.readline()
+            payload = eds_setup_caldav(json.loads(raw or "{}"))
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "create-local-calendar":
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("create-local-calendar currently requires the evolution-data-server provider.")
+            payload = eds_create_local_calendar(args.title)
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "remove-calendar":
+            if not args.calendar_id:
+                raise ValueError("remove-calendar requires --calendar-id.")
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("remove-calendar currently requires the evolution-data-server provider.")
+            payload = eds_remove_calendar(args.calendar_id)
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+        if args.operation == "update-calendars":
+            raw = sys.stdin.readline()
+            items = (json.loads(raw or "{}") or {}).get("calendars") or []
+            if args.provider in ("eds", "evolution-data-server"):
+                payload = eds_update_calendars(items)
+            else:
+                apply_calendar_overrides_to_cache(items)
+                payload = {"ok": True, "provider": args.provider, "calendars": items}
+            json.dump(payload, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\n")
+            return 0
+    except Exception as error:
+        payload = {"ok": False, "provider": args.provider, "error": {"code": "operation-failed", "message": str(error)}}
+        json.dump(payload, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return 1
+
+    if args.provider == "mock":
+        payload = mock_snapshot(start, end)
+        write_cache(payload)
+    elif args.provider in ("eds", "evolution-data-server"):
+        payload = eds_snapshot(start, end, args.operation != "list-calendars")
+    else:
+        payload = {
+            "ok": False,
+            "provider": args.provider,
+            "calendars": [],
+            "events": [],
+            "error": {"code": "unknown-provider", "message": f"Unknown provider: {args.provider}"},
+        }
+
+    if args.operation == "list-calendars":
+        payload = {key: value for key, value in payload.items() if key != "events"}
+
+    json.dump(payload, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0 if payload.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

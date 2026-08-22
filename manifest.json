@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "sirwizardlizard.calendar",
+  "name": "CalDav Calendar",
+  "version": "0.1.0",
+  "author": "sirwizardlizard",
+  "description": "Provider-neutral calendar events in the Omarchy clock popup via Evolution Data Server.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "CalDav Calendar",
+    "description": "Clock popup with local calendar events",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "format": "dddd HH:mm",
+      "formatAlt": "d MMMM 'W'ww yyyy",
+      "provider": "evolution-data-server",
+      "timeFormat": "12h",
+      "weekStartDay": 1,
+      "defaultView": "month",
+      "showWeekNumbers": true,
+      "customWeekStartHour": 8,
+      "customWeekEndHour": 18,
+      "customDayStartHour": 0,
+      "customDayEndHour": 24,
+      "defaultCalendarId": "",
+      "reminderMinutes": 10
+    },
+    "schema": [
+      { "key": "format", "type": "string", "label": "Clock format" },
+      { "key": "formatAlt", "type": "string", "label": "Alternate clock format" },
+      { "key": "provider", "type": "string", "label": "Calendar provider" },
+      { "key": "timeFormat", "type": "string", "label": "Time format" },
+      { "key": "weekStartDay", "type": "number", "label": "Week starts" },
+      { "key": "defaultView", "type": "string", "label": "Default view" },
+      { "key": "showWeekNumbers", "type": "boolean", "label": "Show week numbers" },
+      { "key": "customWeekStartHour", "type": "number", "label": "Custom week start hour" },
+      { "key": "customWeekEndHour", "type": "number", "label": "Custom week end hour" },
+      { "key": "customDayStartHour", "type": "number", "label": "Custom day start hour" },
+      { "key": "customDayEndHour", "type": "number", "label": "Custom day end hour" },
+      { "key": "defaultCalendarId", "type": "string", "label": "Default calendar" },
+      { "key": "reminderMinutes", "type": "number", "label": "Remind me" }
+    ]
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clock"
+  }
+}
