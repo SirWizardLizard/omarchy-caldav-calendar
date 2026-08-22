@@ -2,9 +2,10 @@
   "schemaVersion": 1,
   "id": "sirwizardlizard.calendar",
   "name": "CalDav Calendar",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "author": "sirwizardlizard",
-  "description": "Provider-neutral calendar events in the Omarchy clock popup via Evolution Data Server.",
+  "license": "MIT",
+  "description": "Create events in the Omarchy clock and sync them to iPhone, Mac, and other CalDAV calendars.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {
     "service": "Service.qml",
