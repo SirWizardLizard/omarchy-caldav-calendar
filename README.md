@@ -1,6 +1,8 @@
 # CalDav Calendar
 
-A full calendar in the Omarchy clock. Month, week, and day views, CalDAV sync, meeting links, and reminders — without replacing how the clock sits on the bar.
+Add an event from the Omarchy clock. It shows up on your iPhone, Mac, and everywhere else your CalDAV calendar lives.
+
+iCloud, Nextcloud, Fastmail — same two-way sync. Month, week, and day views, meeting links, and reminders, without moving the clock.
 
 <p align="center">
   <img src="screenshots/month.png" alt="Month view" width="800">
@@ -18,7 +20,7 @@ This replaces the built-in clock. Shortcuts and center placement stay put.
 ## What it does
 
 - Month, week, work week, and day views
-- Create, edit, and delete events (including overnight and recurring)
+- Create, edit, and delete events (including overnight and recurring) — they sync to your phone and other devices
 - iCloud, Nextcloud, Fastmail, and other CalDAV servers
 - Calendars that live only on this computer
 - Join Zoom, Google Meet, or Teams from a link on the event
