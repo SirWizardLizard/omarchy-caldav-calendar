@@ -2,7 +2,9 @@
 
 A full calendar in the Omarchy clock. Month, week, and day views, CalDAV sync, meeting links, and reminders — without replacing how the clock sits on the bar.
 
-![Month view](screenshots/month.png)
+<p align="center">
+  <img src="screenshots/month.png" alt="Month view" width="800">
+</p>
 
 ## Install
 
@@ -22,7 +24,9 @@ This replaces the built-in clock. Shortcuts and center placement stay put.
 - Join Zoom, Google Meet, or Teams from a link on the event
 - Optional desktop reminder 5–30 minutes before timed events
 
-![Week view](screenshots/week.png)
+<p align="center">
+  <img src="screenshots/week.png" alt="Week view" width="480">
+</p>
 
 ## Add iCloud
 
@@ -59,7 +63,9 @@ Paste a Zoom, Meet, or Teams URL on the event (`meet.google.com/…` is fine). *
 
 **Settings → Remind me**: off, or 5 / 10 / 15 / 30 minutes before timed events. Click a meeting toast to join.
 
-![Settings](screenshots/settings.png)
+<p align="center">
+  <img src="screenshots/settings.png" alt="Settings" width="800">
+</p>
 
 ## Not included
 
