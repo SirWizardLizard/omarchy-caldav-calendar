@@ -131,6 +131,15 @@ function pruneFiredKeys(fired, nowMs) {
   return next
 }
 
+function plainDisplay(value, maxLen) {
+  var text = String(value == null ? '' : value)
+  text = text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+  text = text.replace(/<[^>]*>/g, '')
+  var limit = maxLen || 400
+  if (text.length > limit) text = text.slice(0, limit)
+  return text
+}
+
 function normalizedEvent(raw) {
   var event = raw || {}
   var start = String(event.start || '')
@@ -141,11 +150,11 @@ function normalizedEvent(raw) {
     uid: String(event.uid || ''),
     rid: String(event.rid || ''),
     calendarId: String(event.calendarId || event.calendar_uid || ''),
-    calendarName: String(event.calendarName || event.calendar || 'Calendar'),
+    calendarName: plainDisplay(event.calendarName || event.calendar || 'Calendar', 120),
     calendarColor: String(event.calendarColor || event.color || ''),
-    title: String(event.title || event.summary || '(No title)'),
-    location: String(event.location || ''),
-    description: String(event.description || ''),
+    title: plainDisplay(event.title || event.summary || '(No title)', 400) || '(No title)',
+    location: plainDisplay(event.location, 400),
+    description: plainDisplay(event.description, 2000),
     start: start,
     end: end,
     allDay: event.allDay === true,
@@ -594,7 +603,7 @@ function calendarDisplayName(calendar, names) {
   var overrides = names || {}
   var override = overrides[calendar.id]
   if (override) return String(override)
-  return String(calendar.name || 'Calendar')
+  return plainDisplay(calendar.name || 'Calendar', 120) || 'Calendar'
 }
 
 function calendarDisplayColor(calendar, colors, index) {
@@ -1095,6 +1104,7 @@ if (typeof module !== 'undefined') module.exports = {
   normalizedWeekStart,
   parseHelperResponse,
   parseOperationResponse,
+  plainDisplay,
   parseRRule,
   parseTimeText,
   pruneFiredKeys,

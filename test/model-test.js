@@ -25,6 +25,8 @@ assert.equal(events[0].id, '2')
 assert.equal(events[0].uid, '2')
 assert.equal(events[0].calendarId, 'work')
 assert.equal(events[0].title, 'Later')
+assert.equal(model.plainDisplay('<img src="https://evil.test/x">Alert'), 'Alert')
+assert.equal(model.normalizeEvents([{ id: 'x', title: '<b>Hi</b>', start: '2026-08-20T09:00:00Z' }])[0].title, 'Hi')
 
 const grouped = model.eventsByDay(events)
 assert.equal(grouped['2026-08-20'].length, 2)

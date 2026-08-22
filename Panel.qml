@@ -511,7 +511,7 @@ Panel {
     if (calendarName) lines.push(calendarName)
     if (event.location) lines.push(event.location)
     if (event.meetingUrl) lines.push("Join " + Model.meetingProviderLabel(event.meetingProvider))
-    return lines.join("\n")
+    return Model.plainDisplay(lines.join("\n"), 600)
   }
 
   function joinEvent(event) {
@@ -1284,7 +1284,8 @@ Panel {
                 Text {
                   visible: root.createError !== ""
                   width: parent.width
-                  text: root.createError
+                   text: root.createError
+                   textFormat: Text.PlainText
                   color: Color.urgent
                   wrapMode: Text.WordWrap
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -1309,6 +1310,7 @@ Panel {
               visible: !root.showingSettings && calendarService && calendarService.status === "error"
               width: parent.width
               text: calendarService ? calendarService.errorMessage : ""
+              textFormat: Text.PlainText
               color: Color.urgent
               wrapMode: Text.WordWrap
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2040,6 +2042,7 @@ Panel {
             visible: root.setupError !== "" || (calendarService && calendarService.setupStatus !== "")
             width: parent.width
             text: root.setupError || (calendarService ? calendarService.setupStatus : "")
+            textFormat: Text.PlainText
             color: root.setupError !== "" ? Color.urgent : Color.accent
             wrapMode: Text.WordWrap
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2060,6 +2063,7 @@ Panel {
         visible: root.settingsError !== ""
         width: parent.width
         text: root.settingsError
+        textFormat: Text.PlainText
         color: Color.urgent
         wrapMode: Text.WordWrap
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2206,6 +2210,7 @@ Panel {
       id: sourceText
       anchors.verticalCenter: parent.verticalCenter
       text: settingsCalendarRow.sourceLabel
+      textFormat: Text.PlainText
       color: Color.foreground
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.caption
@@ -2896,6 +2901,7 @@ Panel {
       Text {
         width: parent.width
         text: (card.event && card.event.title) || ""
+        textFormat: Text.PlainText
         color: card.labelColor
         wrapMode: card.wrapTitle ? Text.Wrap : Text.NoWrap
         maximumLineCount: card.wrapTitle ? 3 : 1
@@ -2908,6 +2914,7 @@ Panel {
         visible: card.showTime
         width: parent.width
         text: root.eventTimeRange(card.event)
+        textFormat: Text.PlainText
         color: card.labelColor
         opacity: 0.85
         elide: Text.ElideRight
@@ -2947,6 +2954,7 @@ Panel {
       anchors.leftMargin: Style.space(6)
       anchors.rightMargin: Style.space(3)
       text: (card.event && card.event.title) || ""
+      textFormat: Text.PlainText
       color: card.labelColor
       elide: Text.ElideRight
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2963,6 +2971,7 @@ Panel {
         width: Style.space(56)
         anchors.verticalCenter: parent.verticalCenter
         text: Model.eventListTime(card.event, root.selectedKey, root.timeFormat)
+        textFormat: Text.PlainText
         color: card.labelColor
         elide: Text.ElideRight
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2972,6 +2981,7 @@ Panel {
         width: Math.max(0, parent.width - Style.space(62))
         anchors.verticalCenter: parent.verticalCenter
         text: (card.event && card.event.title) || ""
+        textFormat: Text.PlainText
         color: card.labelColor
         elide: Text.ElideRight
         font.family: root.bar ? root.bar.fontFamily : Style.font.family

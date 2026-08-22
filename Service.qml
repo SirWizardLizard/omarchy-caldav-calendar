@@ -40,6 +40,10 @@ Item {
     return decodeURIComponent(Qt.resolvedUrl("helper/omarchy-calendar-helper").toString().replace(/^file:\/\//, ""))
   }
 
+  function failMessage(payload, fallback) {
+    return Model.plainDisplay((payload && payload.error && payload.error.message) || fallback || "Calendar helper failed", 400)
+  }
+
   function snapshot(start, end, requestedProvider, forceSync) {
     var nextStart = String(start || "")
     var nextEnd = String(end || "")
@@ -114,7 +118,7 @@ Item {
       applyCache(payload, true)
     } else if (cachedEvents.length === 0) {
       root.status = "error"
-      root.errorMessage = payload.error && payload.error.message ? payload.error.message : "Calendar helper failed"
+      root.errorMessage = root.failMessage(payload, "Calendar helper failed")
       root.setupStatus = ""
       root.refreshed()
     }
@@ -133,7 +137,7 @@ Item {
     } else {
       root.removePendingCreates(root.pendingCreateId)
       root.status = "error"
-      root.errorMessage = payload.error && payload.error.message ? payload.error.message : "Calendar helper failed"
+      root.errorMessage = root.failMessage(payload, "Calendar helper failed")
       root.eventSaved(false, root.errorMessage)
     }
     root.pendingCreateId = ""
@@ -154,7 +158,7 @@ Item {
     } else {
       if (root.pendingUpdateOriginal) root.mergeEvent(root.pendingUpdateOriginal)
       root.status = "error"
-      root.errorMessage = payload.error && payload.error.message ? payload.error.message : "Calendar helper failed"
+      root.errorMessage = root.failMessage(payload, "Calendar helper failed")
       root.eventSaved(false, root.errorMessage)
     }
     root.pendingUpdateOriginal = null
@@ -171,7 +175,7 @@ Item {
     } else {
       root.status = "error"
       root.setupStatus = ""
-      root.errorMessage = payload.error && payload.error.message ? payload.error.message : "Calendar setup failed"
+      root.errorMessage = root.failMessage(payload, "Calendar setup failed")
       root.setupFinished(false, root.errorMessage)
     }
   }
@@ -608,7 +612,7 @@ Item {
       if (exitCode !== 0) {
         var text = String(deleteOut.text || deleteErr.text || "")
         var payload = Model.parseOperationResponse(text)
-        root.errorMessage = payload.error && payload.error.message ? payload.error.message : "Could not delete event."
+        root.errorMessage = root.failMessage(payload, "Could not delete event.")
         root.status = "error"
       }
     }
