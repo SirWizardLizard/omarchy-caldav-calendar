@@ -37,7 +37,7 @@ For UI changes, also verify in a running Omarchy session and capture before/afte
 
 `omarchy plugin update` pulls `main`. [omarchyplugins.com](https://omarchyplugins.com) stays on a pinned verified SHA until a **[Verify]** issue is filed.
 
-Bump `version` in `manifest.json` on the release PR. After that merge, `.github/workflows/marketplace-verify.yml` files the verify issue if the `MARKETPLACE_TOKEN` secret is set (classic PAT with `public_repo`). Without the secret it opens a reminder issue on this repo instead.
+Merges to `main` do not notify the marketplace. When you want a listing update, bump `version` in `manifest.json`, merge that, then run **Actions → marketplace-verify → Run workflow**. That files the HANCORE **[Verify]** issue if `MARKETPLACE_TOKEN` is set (classic PAT with `public_repo`); otherwise it opens a reminder issue here.
 
 ## Upstream Boundaries
 

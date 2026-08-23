@@ -8,14 +8,6 @@ MARKETPLACE="HANCORE-linux/omarchy-plugin-marketplace"
 SHA="$(git rev-parse HEAD)"
 VERSION="$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')"
 
-if [[ "${GITHUB_EVENT_NAME:-}" == "push" ]] && git rev-parse HEAD^ >/dev/null 2>&1; then
-  previous="$(git show HEAD^:manifest.json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' || true)"
-  if [[ -n "${previous}" && "${previous}" == "${VERSION}" ]]; then
-    echo "manifest version ${VERSION} did not change; skipping"
-    exit 0
-  fi
-fi
-
 title="[Verify]: ${PLUGIN_ID}"
 body="$(cat <<EOF
 ### Verification action

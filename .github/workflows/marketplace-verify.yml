@@ -1,10 +1,6 @@
 name: marketplace-verify
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - manifest.json
   workflow_dispatch:
 
 jobs:
@@ -17,8 +13,6 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
       - name: Request marketplace verification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
