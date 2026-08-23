@@ -380,8 +380,7 @@ Item {
 
   function updateEvent(event, title, startIso, endIso, location, description, scope, allDay, calendarId, meetingUrl, meetingKind) {
     if (!event || event.status === "saving" || !event.uid || String(event.id || "").indexOf("omarchy-calendar-pending-") === 0) {
-      status = "saving"
-      errorMessage = ""
+      root.eventSaved(false, "Could not save the event.")
       return
     }
     var editScope = String(scope || (event.rid || event.recurring ? "this" : "all"))

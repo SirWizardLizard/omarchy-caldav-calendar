@@ -722,6 +722,9 @@ Panel {
     if (meetingUrl && location.indexOf(meetingUrl) < 0 && location.indexOf(meetingInput) < 0) location = location ? (location + " · " + meetingUrl) : meetingUrl
     if (editingEvent) calendarService.updateEvent(editingEvent, titleField.text, startIso, endIso, location, editingEvent.description || "", root.editScope, createAllDay, createCalendarId, meetingUrl, root.createMeetingKind)
     else calendarService.createEvent(calendarId, titleField.text, startIso, endIso, location, "", Model.serializeRecurrence(root.createRecurrence), createAllDay, meetingUrl, root.createMeetingKind)
+    creatingEvent = false
+    editingEvent = null
+    createError = ""
   }
 
   function openEvolution() {

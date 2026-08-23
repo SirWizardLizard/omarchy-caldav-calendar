@@ -122,3 +122,9 @@ too_big = {"ok": True, "provider": "mock", "events": [{"id": "x", "title": "y" *
 bounded = mod.bound_payload(too_big)
 assert len(bounded["events"]) == mod.MAX_EVENTS
 print("ok - helper bounds cache reminders and snapshots")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+assert mod.is_omarchy_source_uid("omarchy-calendar-caldav-9fb4ee14-4efd-4564-a7dd-adc2f704d525")
+assert not mod.is_omarchy_source_uid("c3742f32c586dbe48f75eeb097fe4ed289f3bc2b")
+print("ok - helper omarchy calendar uid")' "$ROOT/helper/omarchy-calendar-helper"
