@@ -418,6 +418,14 @@ def is_omarchy_source_uid(uid: str) -> bool:
     return str(uid or "").startswith("omarchy-calendar-")
 
 
+def is_omarchy_collection_child(source) -> bool:
+    uid = source.get_uid() if hasattr(source, "get_uid") else ""
+    if is_omarchy_source_uid(uid):
+        return False
+    parent = source.get_parent() if hasattr(source, "get_parent") else ""
+    return is_omarchy_source_uid(str(parent or ""))
+
+
 def caldav_source_key(source, modules: EdsModules) -> tuple[str, str] | None:
     host = source_host(source, modules).lower().rstrip(".")
     path = webdav_resource_path(source, modules).rstrip("/") or "/"
@@ -439,27 +447,14 @@ def quiet_omarchy_collection(source, registry, modules: EdsModules) -> None:
 
 
 def eds_prune_duplicate_caldav(registry, modules: EdsModules) -> None:
-    groups: dict[tuple[str, str], list] = {}
-    for source in registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR):
-        if is_unresolved_caldav_root(source, registry, modules):
+    for source in list(registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)):
+        if not is_omarchy_collection_child(source):
             continue
-        key = caldav_source_key(source, modules)
-        if key is None:
-            continue
-        groups.setdefault(key, []).append(source)
-    for group in groups.values():
-        keepers = [source for source in group if is_omarchy_source_uid(source.get_uid()) and registry.check_enabled(source)]
-        if not keepers:
-            continue
-        keep_uid = keepers[0].get_uid()
-        for source in group:
-            if source.get_uid() == keep_uid or is_omarchy_source_uid(source.get_uid()):
-                continue
-            try:
-                source.remove_sync(None)
-            except Exception:
-                source.set_enabled(False)
-                registry.commit_source_sync(source, None)
+        try:
+            source.remove_sync(None)
+        except Exception:
+            source.set_enabled(False)
+            registry.commit_source_sync(source, None)
     for source in registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_COLLECTION):
         quiet_omarchy_collection(source, registry, modules)
 

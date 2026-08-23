@@ -127,4 +127,15 @@ python3 -c 'from importlib.machinery import SourceFileLoader; import sys
 mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
 assert mod.is_omarchy_source_uid("omarchy-calendar-caldav-9fb4ee14-4efd-4564-a7dd-adc2f704d525")
 assert not mod.is_omarchy_source_uid("c3742f32c586dbe48f75eeb097fe4ed289f3bc2b")
+class Child:
+    def __init__(self, uid, parent):
+        self._uid = uid
+        self._parent = parent
+    def get_uid(self):
+        return self._uid
+    def get_parent(self):
+        return self._parent
+assert mod.is_omarchy_collection_child(Child("c3742f32c586dbe48f75eeb097fe4ed289f3bc2b", "omarchy-calendar-caldav-parent"))
+assert not mod.is_omarchy_collection_child(Child("evolution-icloud", None))
+assert not mod.is_omarchy_collection_child(Child("omarchy-calendar-caldav-own", "omarchy-calendar-caldav-parent"))
 print("ok - helper omarchy calendar uid")' "$ROOT/helper/omarchy-calendar-helper"
