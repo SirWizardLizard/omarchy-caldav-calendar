@@ -55,6 +55,7 @@ Same form. Use the provider’s CalDAV URL and an app password when they require
 
 - Nextcloud: `https://your-server/remote.php/dav/`
 - Fastmail: `https://caldav.fastmail.com/`
+- Forward Email: `https://caldav.forwardemail.net` (or `caldav.forwardemail.net`)
 
 ## Meetings
 

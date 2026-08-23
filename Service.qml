@@ -23,6 +23,7 @@ Item {
   property bool syncing: false
   property int generation: 0
   property string setupStatus: ""
+  property bool setupBusy: false
   property string pendingCreateId: ""
   property var pendingUpdateOriginal: null
   property int reminderMinutes: 10
@@ -181,6 +182,7 @@ Item {
   }
 
   function finishSetup(text, exitCode) {
+    setupBusy = false
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
       root.status = "ready"
@@ -551,22 +553,24 @@ Item {
 
 
   function createLocalCalendar(displayName) {
+    if (setupBusy || setupProc.running) return
     provider = "evolution-data-server"
     status = "saving"
     setupStatus = "Creating local calendar..."
     errorMessage = ""
-    if (setupProc.running) setupProc.running = false
+    setupBusy = true
     setupProc.secret = ""
     setupProc.command = [helperPath(), "create-local-calendar", "--provider", provider, "--title", String(displayName || "Calendar")]
     setupProc.running = true
   }
 
   function setupCalDav(displayName, url, username, password) {
+    if (setupBusy || setupProc.running) return
     provider = "evolution-data-server"
     status = "saving"
     setupStatus = "Adding calendar source..."
     errorMessage = ""
-    if (setupProc.running) setupProc.running = false
+    setupBusy = true
     setupProc.secret = JSON.stringify({
       displayName: String(displayName || "Calendar"),
       url: String(url || ""),

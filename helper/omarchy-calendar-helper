@@ -14,6 +14,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -648,7 +650,157 @@ def eds_delete_event(calendar_id: str, uid: str, rid: str = "") -> dict:
     return {"ok": True, "provider": "evolution-data-server", "calendarId": source.get_uid(), "uid": uid, "rid": rid}
 
 
-def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, credentials, username: str, host: str, port: int, committed: list | None = None) -> list:
+SETUP_PATH_ERROR = "path"
+SETUP_AUTH_ERROR = "auth"
+SETUP_TLS_ERROR = "tls"
+SETUP_NETWORK_ERROR = "network"
+MAX_CALDAV_CANDIDATES = 3
+
+
+def normalize_caldav_url(url: str) -> str:
+    text = str(url or "").strip()
+    if text and not text.startswith("http://") and not text.startswith("https://"):
+        return "https://" + text
+    return text
+
+
+def caldav_hostname(url: str) -> str:
+    return (urlsplit(url).hostname or "").lower().rstrip(".")
+
+
+def is_forwardemail_host(host: str) -> bool:
+    return host == "caldav.forwardemail.net" or host.endswith(".forwardemail.net")
+
+
+def looks_like_nextcloud(url: str) -> bool:
+    path = (urlsplit(url).path or "").lower()
+    host = caldav_hostname(url)
+    return "remote.php" in path or "nextcloud" in path or "nextcloud" in host
+
+
+def caldav_url_with_path(url: str, path: str) -> str:
+    return urlsplit(url)._replace(path=path, query="", fragment="").geturl()
+
+
+def caldav_candidate_urls(url: str, username: str = "") -> list[str]:
+    parsed = urlsplit(url)
+    path = parsed.path or ""
+    if path not in ("", "/"):
+        return [url]
+    user = str(username or "").strip()
+    host = caldav_hostname(url)
+    if is_forwardemail_host(host):
+        candidates = [caldav_url_with_path(url, "/dav/")]
+        if user:
+            candidates.append(caldav_url_with_path(url, f"/dav/{user}/"))
+        return candidates[:MAX_CALDAV_CANDIDATES]
+    candidates = [url]
+    extras = ["/.well-known/caldav", "/dav/"]
+    if user:
+        extras.append(f"/dav/{user}/")
+    if looks_like_nextcloud(url):
+        extras.append("/remote.php/dav/")
+    for extra in extras:
+        candidate = caldav_url_with_path(url, extra)
+        if candidate not in candidates:
+            candidates.append(candidate)
+        if len(candidates) >= MAX_CALDAV_CANDIDATES:
+            break
+    return candidates
+
+
+def classify_setup_error(error: BaseException) -> str:
+    text = str(error).lower()
+    if any(mark in text for mark in ("401", "403", "unauthorized", "not authorized", "authentication", "password was rejected", "login failed", "invalid credentials")):
+        return SETUP_AUTH_ERROR
+    if any(mark in text for mark in ("tls", "ssl", "certificate", "handshake")):
+        return SETUP_TLS_ERROR
+    if any(mark in text for mark in ("name or service not known", "temporary failure in name resolution", "network is unreachable", "connection refused", "no route to host", "timed out", "timeout")):
+        return SETUP_NETWORK_ERROR
+    return SETUP_PATH_ERROR
+
+
+def probe_looks_like_caldav(url: str, timeout: float = 3.0) -> bool:
+    request = urllib.request.Request(url, method="OPTIONS")
+    request.add_header("User-Agent", "CalDav-Calendar/1.0")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            dav = str(response.headers.get("DAV") or "")
+            return "calendar-access" in dav.lower()
+    except urllib.error.HTTPError as error:
+        dav = str(error.headers.get("DAV") or "") if error.headers else ""
+        auth = str(error.headers.get("WWW-Authenticate") or "") if error.headers else ""
+        return "calendar-access" in dav.lower() or bool(auth)
+    except Exception:
+        return False
+
+
+def rank_caldav_candidates(url: str, username: str = "") -> list[str]:
+    candidates = caldav_candidate_urls(url, username)
+    if len(candidates) <= 1 or is_forwardemail_host(caldav_hostname(url)):
+        return candidates
+    typed, extras = candidates[0], candidates[1:]
+    extras.sort(key=lambda item: 0 if probe_looks_like_caldav(item) else 1)
+    return [typed] + extras
+
+
+def glib_parse_uri(modules: EdsModules, url: str):
+    flags = [modules.GLib.UriFlags.NONE]
+    encoded = getattr(modules.GLib.UriFlags, "ENCODED", None)
+    if encoded is not None:
+        flags.append(encoded)
+    last_error = None
+    for flag in flags:
+        try:
+            return modules.GLib.Uri.parse(url, flag)
+        except Exception as error:
+            last_error = error
+    raise last_error or ValueError("CalDAV URL could not be parsed.")
+
+
+def eds_attach_calendar_href(modules: EdsModules, registry, parent, credentials, username: str, host: str, port: int, href: str, display_name: str, color: str, committed: list | None) -> dict:
+    child = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-caldav-{uuid4()}", None)
+    child.set_display_name(display_name or parent.get_display_name() or "Calendar")
+    child.set_enabled(True)
+    calendar = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+    calendar.set_backend_name("caldav")
+    calendar.set_selected(True)
+    if color:
+        calendar.set_color(color)
+    uri = glib_parse_uri(modules, href)
+    webdav = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
+    webdav.set_uri(uri)
+    webdav.set_display_name(child.get_display_name())
+    if color:
+        webdav.set_color(color)
+    webdav.set_calendar_auto_schedule(True)
+    child_host = uri.get_host() or host
+    child_port = uri.get_port()
+    if child_port < 0:
+        child_port = 443 if (uri.get_scheme() or "https") == "https" else port
+    auth = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
+    auth.set_host(child_host)
+    auth.set_port(child_port)
+    auth.set_user(username)
+    auth.set_method("plain/password")
+    auth.set_remember_password(True)
+    if not registry.commit_source_sync(child, None):
+        raise ValueError("Failed to save a discovered calendar source.")
+    if committed is not None:
+        committed.append(child)
+    cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
+    if cred_provider.can_store(child):
+        cred_provider.store_sync(child, credentials, True, None)
+    try:
+        client = modules.ECal.Client.connect_sync(child, modules.ECal.ClientSourceType.EVENTS, 10, None)
+        if hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
+            client.refresh_sync(None)
+    except Exception as error:
+        raise ValueError(f"Added {child.get_display_name()}, but the first sync failed: {error}") from error
+    return source_calendar(child, registry, modules)
+
+
+def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, credentials, username: str, host: str, port: int, committed: list | None = None, fallback_href: str = "") -> list:
     result = modules.EDataServer.webdav_discover_sources_sync(
         parent,
         None,
@@ -673,51 +825,36 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
         href = str(getattr(item, "href", "") or "").strip()
         if not href or (supports and (supports & event_flag) == 0):
             continue
-        child = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-caldav-{uuid4()}", None)
-        child.set_display_name(str(getattr(item, "display_name", "") or parent.get_display_name() or "Calendar"))
-        child.set_enabled(True)
+        calendars.append(eds_attach_calendar_href(
+            modules,
+            registry,
+            parent,
+            credentials,
+            username,
+            host,
+            port,
+            href,
+            str(getattr(item, "display_name", "") or parent.get_display_name() or "Calendar"),
+            str(getattr(item, "color", "") or ""),
+            committed,
+        ))
 
-        calendar = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
-        calendar.set_backend_name("caldav")
-        calendar.set_selected(True)
-        color = str(getattr(item, "color", "") or "")
-        if color:
-            calendar.set_color(color)
-
-        uri = modules.GLib.Uri.parse(href, modules.GLib.UriFlags.NONE)
-        webdav = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
-        webdav.set_uri(uri)
-        webdav.set_display_name(child.get_display_name())
-        if color:
-            webdav.set_color(color)
-        webdav.set_calendar_auto_schedule(True)
-
-        child_host = uri.get_host() or host
-        child_port = uri.get_port()
-        if child_port < 0:
-            child_port = 443 if (uri.get_scheme() or "https") == "https" else port
-        auth = child.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
-        auth.set_host(child_host)
-        auth.set_port(child_port)
-        auth.set_user(username)
-        auth.set_method("plain/password")
-        auth.set_remember_password(True)
-
-        if not registry.commit_source_sync(child, None):
-            raise ValueError("Failed to save a discovered calendar source.")
-        if committed is not None:
-            committed.append(child)
-        cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
-        if cred_provider.can_store(child):
-            cred_provider.store_sync(child, credentials, True, None)
-        try:
-            client = modules.ECal.Client.connect_sync(child, modules.ECal.ClientSourceType.EVENTS, 15, None)
-            if hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
-                client.refresh_sync(None)
-        except Exception as error:
-            raise ValueError(f"Added {child.get_display_name()}, but the first sync failed: {error}") from error
-        calendars.append(source_calendar(child, registry, modules))
-
+    if not calendars:
+        path = urlsplit(fallback_href).path or "/"
+        if fallback_href and path not in ("", "/"):
+            calendars.append(eds_attach_calendar_href(
+                modules,
+                registry,
+                parent,
+                credentials,
+                username,
+                host,
+                port,
+                fallback_href,
+                parent.get_display_name() or "Calendar",
+                "",
+                committed,
+            ))
     if not calendars:
         raise ValueError("Connected, but no calendars were found on that CalDAV server.")
     return calendars
@@ -725,7 +862,7 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
 
 def eds_setup_caldav(payload: dict) -> dict:
     display_name = str(payload.get("displayName") or "Calendar").strip()
-    url = str(payload.get("url") or "").strip()
+    url = normalize_caldav_url(payload.get("url") or "")
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")
     if not url:
@@ -736,17 +873,31 @@ def eds_setup_caldav(payload: dict) -> dict:
         raise ValueError("Password is required.")
     if any(character.isspace() for character in url):
         raise ValueError("CalDAV URL cannot contain spaces.")
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
         raise ValueError("CalDAV URL must include http(s) scheme and host.")
     if any(character.isspace() for character in parsed.hostname):
         raise ValueError("CalDAV URL host cannot contain spaces.")
 
+    first_error = None
+    for candidate in rank_caldav_candidates(url, username):
+        try:
+            return eds_setup_caldav_url(display_name, candidate, username, password)
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+            kind = classify_setup_error(error)
+            if kind == SETUP_AUTH_ERROR:
+                raise ValueError("Username or password was rejected.") from error
+            if kind != SETUP_PATH_ERROR:
+                raise
+    raise first_error or ValueError("Could not discover calendars on that CalDAV server.")
+
+
+def eds_setup_caldav_url(display_name: str, url: str, username: str, password: str) -> dict:
     modules = load_eds_modules()
     registry = modules.EDataServer.SourceRegistry.new_sync(None)
-    uri = modules.GLib.Uri.parse(url, modules.GLib.UriFlags.NONE)
+    uri = glib_parse_uri(modules, url)
     host = uri.get_host() or ""
     port = uri.get_port()
     if port < 0:
@@ -802,7 +953,7 @@ def eds_setup_caldav(payload: dict) -> dict:
             raise ValueError("Evolution Data Server cannot store credentials for this source.")
         provider.store_sync(source, credentials, True, None)
 
-        calendars = eds_attach_discovered_calendars(modules, registry, source, credentials, username, host, port, committed)
+        calendars = eds_attach_discovered_calendars(modules, registry, source, credentials, username, host, port, committed, url)
     except Exception:
         for created in reversed(committed):
             if hasattr(created, "remove_sync"):

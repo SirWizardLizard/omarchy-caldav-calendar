@@ -584,6 +584,7 @@ Panel {
       setupError = "Calendar service is not loaded."
       return
     }
+    if (calendarService.setupBusy) return
     if (setupKind === "local") {
       if (setupName === "") {
         setupError = "Give the calendar a name."

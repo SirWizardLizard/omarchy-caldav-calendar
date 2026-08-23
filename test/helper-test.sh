@@ -122,3 +122,34 @@ too_big = {"ok": True, "provider": "mock", "events": [{"id": "x", "title": "y" *
 bounded = mod.bound_payload(too_big)
 assert len(bounded["events"]) == mod.MAX_EVENTS
 print("ok - helper bounds cache reminders and snapshots")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+assert mod.normalize_caldav_url("caldav.forwardemail.net") == "https://caldav.forwardemail.net"
+fwd = mod.caldav_candidate_urls("https://caldav.forwardemail.net", "user@example.com")
+assert fwd[0] == "https://caldav.forwardemail.net/dav/"
+assert "https://caldav.forwardemail.net/dav/user@example.com/" in fwd
+assert "https://caldav.forwardemail.net/" not in fwd
+assert len(fwd) <= mod.MAX_CALDAV_CANDIDATES
+icloud = mod.caldav_candidate_urls("https://caldav.icloud.com/", "me@icloud.com")
+assert icloud[0] == "https://caldav.icloud.com/"
+typed = mod.caldav_candidate_urls("https://caldav.forwardemail.net/dav/", "user@example.com")
+assert typed == ["https://caldav.forwardemail.net/dav/"]
+nextcloud = mod.caldav_candidate_urls("https://cloud.example/remote.php/dav/", "me")
+assert nextcloud == ["https://cloud.example/remote.php/dav/"]
+bare = mod.caldav_candidate_urls("https://caldav.example.com", "me")
+assert bare[0] == "https://caldav.example.com"
+assert "https://caldav.example.com/dav/" in bare
+assert mod.classify_setup_error(ValueError("401 Unauthorized")) == mod.SETUP_AUTH_ERROR
+assert mod.classify_setup_error(ValueError("Could not discover calendars on that CalDAV server.")) == mod.SETUP_PATH_ERROR
+assert mod.classify_setup_error(ValueError("TLS handshake failed")) == mod.SETUP_TLS_ERROR
+print("ok - helper caldav discovery urls")' "$ROOT/helper/omarchy-calendar-helper"
+
+if python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+assert mod.probe_looks_like_caldav("https://caldav.forwardemail.net/dav/") is True
+print("ok - helper live forwardemail probe")' "$ROOT/helper/omarchy-calendar-helper"; then
+  true
+else
+  echo "ok - helper live forwardemail probe skipped"
+fi
