@@ -18,6 +18,10 @@ This project follows Omarchy's plugin model and development conventions where ap
 - Markdown uses full lines rather than hard-wrapping at 80 columns.
 - Provider-facing data should be normalized before reaching QML.
 
+## Branching
+
+`main` only accepts pull requests. Open a branch, push it, and merge through GitHub. GitHub Actions runs `./test/all` on every PR.
+
 ## Verification
 
 Run:
@@ -28,6 +32,12 @@ omarchy plugin validate .
 ```
 
 For UI changes, also verify in a running Omarchy session and capture before/after screenshots when preparing a public release.
+
+## Marketplace updates
+
+`omarchy plugin update` pulls `main`. [omarchyplugins.com](https://omarchyplugins.com) stays on a pinned verified SHA until a **[Verify]** issue is filed.
+
+Bump `version` in `manifest.json` on the release PR. After that merge, `.github/workflows/marketplace-verify.yml` files the verify issue if the `MARKETPLACE_TOKEN` secret is set (classic PAT with `public_repo`). Without the secret it opens a reminder issue on this repo instead.
 
 ## Upstream Boundaries
 
