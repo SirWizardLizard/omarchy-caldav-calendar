@@ -23,8 +23,15 @@ Item {
   property bool syncing: false
   property int generation: 0
   property string setupStatus: ""
+  property bool setupBusy: false
+  property bool ignoreCache: false
+  property int liveToken: 0
+  property int cacheToken: 0
   property string pendingCreateId: ""
   property var pendingUpdateOriginal: null
+  property var pendingUpdateEvents: []
+  property string pendingUpdateScope: ""
+  property var pendingDeleteEvents: []
   property int reminderMinutes: 10
   property string reminderTimeFormat: "12h"
   property var firedReminders: ({})
@@ -77,7 +84,13 @@ Item {
     readCache()
     var stale = !isNaN(lastSyncAt.getTime()) && (Date.now() - lastSyncAt.getTime() > 15 * 60 * 1000)
     var shouldSync = forceSync === true || (cachedEvents.length === 0 && !snapshotProc.running) || stale
-    if (shouldSync) startLiveSync()
+    if (shouldSync) startLiveSync(false)
+  }
+
+  function pollRemote() {
+    if (!activeStart || !activeEnd) return
+    if (snapshotProc.running) return
+    startLiveSync(true)
   }
 
   function showActiveRange() {
@@ -87,8 +100,25 @@ Item {
     root.refreshed()
   }
 
+  function unionCalendars(existing, incoming) {
+    var byId = {}
+    var out = []
+    var i
+    for (i = 0; i < (incoming || []).length; i++) {
+      if (incoming[i] && incoming[i].id) {
+        byId[incoming[i].id] = true
+        out.push(incoming[i])
+      }
+    }
+    for (i = 0; i < (existing || []).length; i++) {
+      if (existing[i] && existing[i].id && !byId[existing[i].id]) out.push(existing[i])
+    }
+    return out.slice(0, 200)
+  }
+
   function applyCache(payload, fromLive) {
-    root.cachedCalendars = (payload.calendars || []).slice(0, 200)
+    var incoming = (payload.calendars || []).slice(0, 200)
+    root.cachedCalendars = fromLive ? incoming : root.unionCalendars(root.cachedCalendars, incoming)
     root.cachedEvents = (payload.events || []).slice(0, 8000)
     showActiveRange()
     root.status = "ready"
@@ -104,24 +134,42 @@ Item {
   }
 
   function readCache() {
-    if (cacheProc.running) return
+    if (cacheProc.running || mutationBusy()) return
+    cacheProc.token = cacheToken
     cacheProc.command = [helperPath(), "snapshot", "--from-cache", "--provider", provider, "--from", activeStart, "--to", activeEnd]
     cacheProc.running = true
   }
 
-  function startLiveSync() {
+  function discardInFlightSnapshot() {
+    liveToken += 1
+    snapshotProc.token = -1
+    cacheToken += 1
+  }
+
+  function mutationBusy() {
+    return createProc.running || deleteProc.running || updateProc.running
+  }
+
+  function startLiveSync(ifChanged) {
     if (snapshotProc.running) {
-      pendingSnapshot = { start: activeStart, end: activeEnd, provider: provider }
+      pendingSnapshot = { start: activeStart, end: activeEnd, provider: provider, ifChanged: ifChanged === true }
+      discardInFlightSnapshot()
+      if (ifChanged !== true) snapshotProc.running = false
       return
     }
-    if (cachedEvents.length === 0) status = "loading"
+    liveToken += 1
+    snapshotProc.token = liveToken
+    if (cachedEvents.length === 0 && ifChanged !== true) status = "loading"
     syncing = true
     snapshotTimeout.restart()
     snapshotProc.command = [helperPath(), "snapshot", "--provider", provider, "--from", activeStart, "--to", activeEnd]
+    if (ifChanged === true) snapshotProc.command.push("--if-changed")
     snapshotProc.running = true
   }
 
   function finishCache(text, exitCode) {
+    if (ignoreCache || mutationBusy()) return
+    if (cacheProc.token !== root.cacheToken) return
     var payload = Model.parseHelperResponse(text)
     if (exitCode === 0 && payload.ok) applyCache(payload, false)
   }
@@ -131,6 +179,7 @@ Item {
     syncing = false
     var payload = Model.parseHelperResponse(text)
     if (exitCode === 0 && payload.ok) {
+      ignoreCache = false
       applyCache(payload, true)
     } else if (cachedEvents.length === 0) {
       root.status = "error"
@@ -144,12 +193,13 @@ Item {
   function finishCreate(text, exitCode) {
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
-      root.confirmPendingCreates(root.pendingCreateId)
+      root.removePendingCreates(root.pendingCreateId)
+      if (payload.event) root.mergeEvent(payload.event)
       root.status = "ready"
       root.errorMessage = ""
       root.eventCreated(payload.event)
       root.eventSaved(true, "")
-      if (root.activeStart && root.activeEnd) root.snapshot(root.activeStart, root.activeEnd, root.provider, true)
+      if (root.activeStart && root.activeEnd) root.startLiveSync(true)
     } else {
       root.removePendingCreates(root.pendingCreateId)
       root.status = "error"
@@ -162,7 +212,8 @@ Item {
   function finishUpdate(text, exitCode) {
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
-      if (payload.event) root.mergeEvent(payload.event)
+      if (payload.event && root.pendingUpdateScope === "all") root.applySeriesFields(payload.event)
+      else if (payload.event) root.mergeEvent(payload.event)
       if (root.pendingUpdateOriginal && payload.event && root.pendingUpdateOriginal.calendarId && payload.event.calendarId && root.pendingUpdateOriginal.calendarId !== payload.event.calendarId) {
         root.removeEventsByUid(root.pendingUpdateOriginal.uid, root.pendingUpdateOriginal.calendarId)
       }
@@ -170,24 +221,45 @@ Item {
       root.errorMessage = ""
       root.eventSaved(true, "")
       if (root.pendingUpdateOriginal && payload.event && root.pendingUpdateOriginal.calendarId !== payload.event.calendarId) root.readCache()
-      else if (root.activeStart && root.activeEnd) root.snapshot(root.activeStart, root.activeEnd, root.provider, true)
+      else if (root.activeStart && root.activeEnd) root.startLiveSync(true)
     } else {
-      if (root.pendingUpdateOriginal) root.mergeEvent(root.pendingUpdateOriginal)
+      for (var i = 0; i < (root.pendingUpdateEvents || []).length; i++) root.mergeEvent(root.pendingUpdateEvents[i])
       root.status = "error"
       root.errorMessage = root.failMessage(payload, "Calendar helper failed")
       root.eventSaved(false, root.errorMessage)
     }
     root.pendingUpdateOriginal = null
+    root.pendingUpdateEvents = []
+    root.pendingUpdateScope = ""
   }
 
   function finishSetup(text, exitCode) {
+    setupBusy = false
+    setupTimeout.stop()
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
+      var added = payload.calendars && payload.calendars.length ? payload.calendars : (payload.calendar ? [payload.calendar] : [])
+      if (added.length) {
+        var next = (root.cachedCalendars || []).slice()
+        var seen = {}
+        for (var i = 0; i < next.length; i++) if (next[i] && next[i].id) seen[next[i].id] = i
+        for (var j = 0; j < added.length; j++) {
+          var calendar = added[j]
+          if (!calendar || !calendar.id) continue
+          calendar.readonly = false
+          if (seen[calendar.id] >= 0) next[seen[calendar.id]] = calendar
+          else next.push(calendar)
+        }
+        root.cachedCalendars = next
+        root.showActiveRange()
+      }
       root.status = "ready"
       root.errorMessage = ""
-      root.setupStatus = ""
+      root.setupStatus = "Syncing new calendar..."
       root.setupFinished(true, "Calendar source added.")
-      root.snapshot(root.activeStart || new Date().toISOString(), root.activeEnd || new Date(Date.now() + 31 * 86400000).toISOString(), root.provider, true)
+      root.ignoreCache = true
+      if (root.activeStart && root.activeEnd) root.startLiveSync(false)
+      else root.snapshot(new Date().toISOString(), new Date(Date.now() + 31 * 86400000).toISOString(), root.provider, true)
     } else {
       root.status = "error"
       root.setupStatus = ""
@@ -200,7 +272,10 @@ Item {
     if (!pendingSnapshot) return
     var pending = pendingSnapshot
     pendingSnapshot = null
-    snapshot(pending.start, pending.end, pending.provider, true)
+    activeStart = pending.start
+    activeEnd = pending.end
+    provider = pending.provider
+    startLiveSync(pending.ifChanged === true)
   }
 
   function eventsForDay(key) {
@@ -244,6 +319,39 @@ Item {
       provider: provider,
       source: calendar.source || "Evolution Data Server"
     }
+  }
+
+  function copyEvent(event) {
+    var next = {}
+    if (!event) return next
+    Object.keys(event).forEach(function(key) { next[key] = event[key] })
+    return next
+  }
+
+  function applySeriesFields(event) {
+    if (!event || !event.uid) return
+    var source = cachedEvents.length ? cachedEvents : events
+    var next = []
+    for (var i = 0; i < source.length; i++) {
+      var item = source[i]
+      if (!item || item.uid !== event.uid || item.calendarId !== event.calendarId) {
+        next.push(item)
+        continue
+      }
+      var copy = copyEvent(item)
+      copy.title = event.title
+      copy.location = event.location
+      copy.description = event.description
+      copy.status = event.status || copy.status
+      if (item.id === event.id) {
+        copy.start = event.start
+        copy.end = event.end
+        copy.allDay = event.allDay
+      }
+      next.push(copy)
+    }
+    cachedEvents = Model.normalizeEvents(next)
+    showActiveRange()
   }
 
   function mergeEvent(event) {
@@ -324,9 +432,16 @@ Item {
     var deleteScope = String(scope || (event.rid || event.recurring ? "this" : "all"))
     provider = "evolution-data-server"
     errorMessage = ""
+    discardInFlightSnapshot()
+    var source = cachedEvents.length ? cachedEvents : events
+    pendingDeleteEvents = []
+    for (var d = 0; d < source.length; d++) {
+      if (!source[d]) continue
+      if (deleteScope === "all" && source[d].uid === event.uid && source[d].calendarId === event.calendarId) pendingDeleteEvents.push(copyEvent(source[d]))
+      else if (deleteScope !== "all" && source[d].id === event.id) pendingDeleteEvents.push(copyEvent(source[d]))
+    }
     if (deleteScope === "all") {
       var kept = []
-      var source = cachedEvents.length ? cachedEvents : events
       for (var i = 0; i < source.length; i++) {
         if (!source[i] || source[i].uid !== event.uid || source[i].calendarId !== event.calendarId) kept.push(source[i])
       }
@@ -352,6 +467,7 @@ Item {
     status = "saving"
     errorMessage = ""
     if (createProc.running) createProc.running = false
+    discardInFlightSnapshot()
     pendingCreateId = "omarchy-calendar-pending-" + Date.now()
     var pending = optimisticEvent(calendarId || defaultWritableCalendarId(), pendingCreateId, "", title, startIso, endIso, location, description, "saving", allDay)
     var expanded = Model.expandRecurringEvent(pending, repeat, activeStart, activeEnd)
@@ -388,12 +504,21 @@ Item {
     status = "saving"
     errorMessage = ""
     if (updateProc.running) updateProc.running = false
+    discardInFlightSnapshot()
     pendingUpdateOriginal = event
+    pendingUpdateScope = editScope
+    pendingUpdateEvents = []
+    var seen = cachedEvents.length ? cachedEvents : events
+    for (var u = 0; u < seen.length; u++) {
+      if (!seen[u] || seen[u].uid !== event.uid || seen[u].calendarId !== event.calendarId) continue
+      if (editScope === "all" || seen[u].id === event.id) pendingUpdateEvents.push(copyEvent(seen[u]))
+    }
     var destId = String(calendarId || event.calendarId || defaultWritableCalendarId())
     var next = optimisticEvent(destId, event.id, event.uid, title, startIso, endIso, location, description, "saving", allDay)
     next.rid = event.rid || ""
     next.recurring = event.recurring === true
-    mergeEvent(next)
+    if (editScope === "all") applySeriesFields(next)
+    else mergeEvent(next)
     updateProc.command = [
       helperPath(), "update-event",
       "--provider", provider,
@@ -561,11 +686,12 @@ Item {
   }
 
   function setupCalDav(displayName, url, username, password) {
+    if (setupBusy || setupProc.running) return
     provider = "evolution-data-server"
     status = "saving"
     setupStatus = "Adding calendar source..."
     errorMessage = ""
-    if (setupProc.running) setupProc.running = false
+    setupBusy = true
     setupProc.secret = JSON.stringify({
       displayName: String(displayName || "Calendar"),
       url: String(url || ""),
@@ -574,10 +700,12 @@ Item {
     })
     setupProc.command = [helperPath(), "setup-caldav", "--provider", provider]
     setupProc.running = true
+    setupTimeout.restart()
   }
 
   Process {
     id: cacheProc
+    property int token: 0
     running: false
 
     stdout: StdioCollector { id: cacheOut; waitForEnd: true }
@@ -590,12 +718,19 @@ Item {
 
   Process {
     id: snapshotProc
+    property int token: 0
     running: false
 
     stdout: StdioCollector { id: snapshotOut; waitForEnd: true }
     stderr: StdioCollector { id: snapshotErr; waitForEnd: true }
 
     onExited: function(exitCode) {
+      if (token !== root.liveToken) {
+        root.syncing = false
+        root.snapshotTimeout.stop()
+        root.runPendingSnapshot()
+        return
+      }
       root.finishSnapshot(root.helperText(snapshotOut.text, snapshotErr.text), exitCode)
     }
   }
@@ -620,9 +755,14 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0) {
         var payload = Model.parseOperationResponse(root.helperText(deleteOut.text, deleteErr.text))
+        for (var i = 0; i < (root.pendingDeleteEvents || []).length; i++) root.mergeEvent(root.pendingDeleteEvents[i])
+        root.pendingDeleteEvents = []
         root.errorMessage = root.failMessage(payload, "Could not delete event.")
         root.status = "error"
+        return
       }
+      root.pendingDeleteEvents = []
+      if (root.activeStart && root.activeEnd) root.startLiveSync(true)
     }
   }
 
@@ -726,6 +866,17 @@ Item {
   }
 
   Component.onCompleted: root.bootReminders()
+
+  Timer {
+    id: setupTimeout
+    interval: 25000
+    repeat: false
+    onTriggered: {
+      if (!setupProc.running) return
+      setupProc.running = false
+      root.finishSetup(JSON.stringify({ ok: false, error: { message: "Adding the calendar timed out. Check the URL and try again." } }), 1)
+    }
+  }
 
   Timer {
     id: snapshotTimeout

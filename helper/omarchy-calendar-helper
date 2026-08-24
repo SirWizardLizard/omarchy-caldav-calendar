@@ -17,8 +17,11 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 from uuid import uuid4
+from xml.etree import ElementTree as ET
+import urllib.error
+import urllib.request
 
 MAX_CACHE_BYTES = 8 * 1024 * 1024
 MAX_REMINDER_BYTES = 256 * 1024
@@ -46,7 +49,7 @@ def read_limited_text(path: Path, max_bytes: int) -> str | None:
 
 
 def read_stdin_limited(max_bytes: int) -> str:
-    data = sys.stdin.read(max_bytes + 1)
+    data = sys.stdin.readline(max_bytes + 1)
     if len(data.encode("utf-8")) > max_bytes:
         raise ValueError("Request was too large.")
     return data
@@ -218,6 +221,25 @@ def source_host(source, modules: EdsModules) -> str:
     if uri is None:
         return ""
     return str(uri.get_host() or "")
+
+
+def source_webdav_url(source, modules: EdsModules) -> str:
+    eds = modules.EDataServer
+    if not source.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
+        return ""
+    uri = source.get_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND).dup_uri()
+    if uri is None:
+        return ""
+    scheme = uri.get_scheme() or "https"
+    host = uri.get_host() or ""
+    path = uri.get_path() or "/"
+    port = int(uri.get_port() or 0)
+    if not host:
+        return ""
+    default_port = 443 if scheme == "https" else 80
+    if port > 0 and port != default_port:
+        return f"{scheme}://{host}:{port}{path}"
+    return f"{scheme}://{host}{path}"
 
 
 def source_calendar(source, registry, modules: EdsModules) -> dict:
@@ -671,7 +693,7 @@ def eds_update_event(calendar_id: str, uid: str, rid: str, title: str, start: da
     calendar["readonly"] = False
     component = modules.ECal.Component.new_from_icalcomponent(existing.clone())
     event = component_event(component, calendar, modules, client)
-    merge_cache_event(event)
+    merge_cache_event(event, series=not bool(rid))
     return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "event": event, "uid": uid, "rid": rid}
 
 
@@ -688,8 +710,12 @@ def eds_delete_event(calendar_id: str, uid: str, rid: str = "") -> dict:
     else:
         cache = read_cache()
         if cache:
+            for event in cache.get("events") or []:
+                if event.get("uid") == uid and event.get("calendarId") == source.get_uid():
+                    note_event_touch(cache, event, "delete")
+            note_local_touch(cache, source.get_uid(), uid, "delete")
             cache["events"] = [event for event in (cache.get("events") or []) if event.get("uid") != uid or event.get("calendarId") != source.get_uid()]
-            write_cache(cache)
+            write_cache(cache, bump=True)
     return {"ok": True, "provider": "evolution-data-server", "calendarId": source.get_uid(), "uid": uid, "rid": rid}
 
 
@@ -768,6 +794,200 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
     return calendars
 
 
+DAV_NS = "{DAV:}"
+CALDAV_NS = "{urn:ietf:params:xml:ns:caldav}"
+MAX_CALDAV_CANDIDATES = 3
+PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:resourcetype/>
+    <d:displayname/>
+    <d:current-user-principal/>
+    <c:calendar-home-set/>
+  </d:prop>
+</d:propfind>
+"""
+
+
+def normalize_caldav_url(url: str) -> str:
+    text = str(url or "").strip()
+    if text and not text.startswith("http://") and not text.startswith("https://"):
+        return "https://" + text
+    return text
+
+
+def caldav_hostname(url: str) -> str:
+    return (urlsplit(url).hostname or "").lower().rstrip(".")
+
+
+def is_forwardemail_host(host: str) -> bool:
+    return host == "caldav.forwardemail.net" or host.endswith(".forwardemail.net")
+
+
+def caldav_url_with_path(url: str, path: str) -> str:
+    return urlsplit(url)._replace(path=path, query="", fragment="").geturl()
+
+
+def caldav_candidate_urls(url: str, username: str = "") -> list[str]:
+    parsed = urlsplit(url)
+    path = parsed.path or ""
+    if path not in ("", "/"):
+        return [url]
+    user = str(username or "").strip()
+    host = caldav_hostname(url)
+    if is_forwardemail_host(host):
+        candidates = [caldav_url_with_path(url, "/dav/")]
+        if user:
+            candidates.insert(0, caldav_url_with_path(url, f"/dav/{user}/"))
+        return candidates[:MAX_CALDAV_CANDIDATES]
+    return [url]
+
+
+def parse_caldav_multistatus(xml_bytes: bytes, base_url: str) -> tuple[list[dict], list[str], list[str]]:
+    root = ET.fromstring(xml_bytes)
+    calendars = []
+    homes = []
+    principals = []
+    for response in root.iter(f"{DAV_NS}response"):
+        href = (response.findtext(f"{DAV_NS}href") or "").strip()
+        absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
+        resourcetype = response.find(f".//{DAV_NS}resourcetype")
+        is_calendar = resourcetype is not None and resourcetype.find(f"{CALDAV_NS}calendar") is not None
+        name = (response.findtext(f".//{DAV_NS}displayname") or "").strip()
+        if is_calendar:
+            calendars.append({"href": absolute, "name": name})
+        for home in response.iter(f"{CALDAV_NS}calendar-home-set"):
+            home_href = (home.findtext(f"{DAV_NS}href") or "").strip()
+            if home_href:
+                homes.append(urljoin(absolute, home_href))
+        for principal in response.iter(f"{DAV_NS}current-user-principal"):
+            principal_href = (principal.findtext(f"{DAV_NS}href") or "").strip()
+            if principal_href:
+                principals.append(urljoin(absolute, principal_href))
+    return calendars, homes, principals
+
+
+def caldav_propfind(url: str, username: str, password: str, timeout: float = 8.0) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, data=PROPFIND_BODY, method="PROPFIND")
+    request.add_header("Depth", "1")
+    request.add_header("Content-Type", "application/xml; charset=utf-8")
+    request.add_header("User-Agent", "CalDav-Calendar/1.0")
+    manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    parsed = urlsplit(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    manager.add_password(None, origin, username, password)
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(manager))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return int(getattr(response, "status", 200) or 200), response.read()
+    except urllib.error.HTTPError as error:
+        return int(error.code), error.read() if error.fp else b""
+    except TimeoutError as error:
+        raise ValueError("Calendar server timed out.") from error
+    except urllib.error.URLError as error:
+        raise ValueError("Could not reach that CalDAV server.") from error
+
+
+def discover_caldav_calendars(url: str, username: str, password: str) -> list[dict]:
+    pending = caldav_candidate_urls(url, username)
+    seen: set[str] = set()
+    found: list[dict] = []
+    while pending and len(seen) < 4:
+        current = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        status, body = caldav_propfind(current, username, password)
+        if status in (401, 403):
+            raise ValueError("Username or password was rejected.")
+        if status not in (200, 207) or not body:
+            continue
+        calendars, homes, principals = parse_caldav_multistatus(body, current)
+        for calendar in calendars:
+            if calendar["href"] not in {item["href"] for item in found}:
+                found.append(calendar)
+        for extra in homes + principals:
+            if extra not in seen and extra not in pending:
+                pending.append(extra)
+    return found
+
+
+def glib_parse_uri(modules: EdsModules, url: str):
+    flags = [modules.GLib.UriFlags.NONE]
+    encoded = getattr(modules.GLib.UriFlags, "ENCODED", None)
+    if encoded is not None:
+        flags.append(encoded)
+    last_error = None
+    for flag in flags:
+        try:
+            return modules.GLib.Uri.parse(url, flag)
+        except Exception as error:
+            last_error = error
+    raise last_error or ValueError("CalDAV URL could not be parsed.")
+
+
+def eds_add_direct_calendar(modules: EdsModules, registry, href: str, display_name: str, username: str, password: str, committed: list) -> dict:
+    source = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-caldav-{uuid4()}", None)
+    source.set_display_name(display_name or "Calendar")
+    source.set_enabled(True)
+    calendar = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+    calendar.set_backend_name("caldav")
+    calendar.set_selected(True)
+    uri = glib_parse_uri(modules, href)
+    webdav = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
+    webdav.set_uri(uri)
+    webdav.set_display_name(source.get_display_name())
+    webdav.set_calendar_auto_schedule(True)
+    host = uri.get_host() or ""
+    port = uri.get_port()
+    if port < 0:
+        port = 443 if (uri.get_scheme() or "https") == "https" else 80
+    auth = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
+    auth.set_host(host)
+    auth.set_port(port)
+    auth.set_user(username)
+    auth.set_method("plain/password")
+    auth.set_remember_password(True)
+    if not registry.commit_source_sync(source, None):
+        raise ValueError("Failed to save a discovered calendar source.")
+    committed.append(source)
+    credentials = modules.EDataServer.NamedParameters.new()
+    credentials.set(modules.EDataServer.SOURCE_CREDENTIAL_USERNAME, username)
+    credentials.set(modules.EDataServer.SOURCE_CREDENTIAL_PASSWORD, password)
+    provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
+    if provider.can_store(source):
+        provider.store_sync(source, credentials, True, None)
+    return source_calendar(source, registry, modules)
+
+
+def eds_setup_caldav_propfind(display_name: str, url: str, username: str, password: str) -> dict:
+    found = discover_caldav_calendars(url, username, password)
+    if not found:
+        raise ValueError("Connected, but no calendars were found on that CalDAV server.")
+    modules = load_eds_modules()
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    committed: list = []
+    calendars = []
+    try:
+        for index, item in enumerate(found):
+            name = item.get("name") or (display_name if index == 0 else f"{display_name} {index + 1}")
+            added = eds_add_direct_calendar(modules, registry, item["href"], name, username, password, committed)
+            added["readonly"] = False
+            calendars.append(added)
+    except Exception:
+        for created in reversed(committed):
+            if hasattr(created, "remove_sync"):
+                created.remove_sync(None)
+        raise
+    merge_cache_calendars(calendars)
+    return {
+        "ok": True,
+        "provider": "evolution-data-server",
+        "calendar": calendars[0],
+        "calendars": calendars,
+    }
+
+
 def eds_setup_caldav(payload: dict) -> dict:
     display_name = str(payload.get("displayName") or "Calendar").strip()
     url = str(payload.get("url") or "").strip()
@@ -788,6 +1008,8 @@ def eds_setup_caldav(payload: dict) -> dict:
         raise ValueError("CalDAV URL must include http(s) scheme and host.")
     if any(character.isspace() for character in parsed.hostname):
         raise ValueError("CalDAV URL host cannot contain spaces.")
+    if is_forwardemail_host(caldav_hostname(url)):
+        return eds_setup_caldav_propfind(display_name, url, username, password)
 
     modules = load_eds_modules()
     registry = modules.EDataServer.SourceRegistry.new_sync(None)
@@ -863,7 +1085,407 @@ def eds_setup_caldav(payload: dict) -> dict:
     }
 
 
-def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) -> dict:
+SYNC_REPORT_BODY = """<?xml version="1.0" encoding="utf-8"?>
+<d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:sync-token>{token}</d:sync-token>
+  <d:sync-level>1</d:sync-level>
+  <d:prop>
+    <d:getetag/>
+    <c:calendar-data/>
+  </d:prop>
+</d:sync-collection>
+"""
+SYNC_PROBE_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:supported-report-set/>
+    <d:sync-token/>
+    <cs:getctag/>
+  </d:prop>
+</d:propfind>
+"""
+CS_NS = "{http://calendarserver.org/ns/}"
+
+
+def lookup_source_credentials(source, registry, modules: EdsModules) -> tuple[str, str]:
+    try:
+        provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
+        result = provider.lookup_sync(source, None)
+    except Exception:
+        return "", ""
+    creds = result[1] if isinstance(result, tuple) and len(result) > 1 else result
+    if creds is None:
+        return "", ""
+    username = ""
+    password = ""
+    try:
+        username = creds.get(modules.EDataServer.SOURCE_CREDENTIAL_USERNAME) or ""
+        password = creds.get(modules.EDataServer.SOURCE_CREDENTIAL_PASSWORD) or ""
+    except Exception:
+        username, password = "", ""
+    if not username and source.has_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION):
+        username = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION).get_user() or ""
+    return str(username), str(password)
+
+
+def caldav_http(method: str, url: str, username: str, password: str, body: bytes = b"", headers: dict | None = None, timeout: float = 25.0) -> tuple[int, bytes, object]:
+    request = urllib.request.Request(url, data=body or None, method=method)
+    request.add_header("User-Agent", "CalDav-Calendar/1.0")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    parsed = urlsplit(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    manager.add_password(None, origin, username, password)
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(manager))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return int(getattr(response, "status", 200) or 200), response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        return int(error.code), error.read() if error.fp else b"", error.headers
+    except Exception as error:
+        sync_log("sync-http-error", method=method, host=parsed.hostname or "", error=str(error)[:200])
+        return 0, b"", None
+
+
+def href_event_uid(href: str) -> str:
+    name = urlsplit(href).path.rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".ics"):
+        name = name[:-4]
+    return unquote(name)
+
+
+def parse_sync_support(xml_bytes: bytes) -> tuple[bool, str]:
+    supported, token, _ctag = parse_sync_probe(xml_bytes)
+    return supported, token
+
+
+def parse_sync_probe(xml_bytes: bytes) -> tuple[bool, str, str]:
+    if not xml_bytes:
+        return False, "", ""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return False, "", ""
+    token = ""
+    ctag = ""
+    for node in root.iter(f"{DAV_NS}sync-token"):
+        if (node.text or "").strip():
+            token = (node.text or "").strip()
+            break
+    for node in root.iter(f"{CS_NS}getctag"):
+        if (node.text or "").strip():
+            ctag = (node.text or "").strip()
+            break
+    reports = " ".join((node.text or "") + "".join(node.itertext()) for node in root.iter(f"{DAV_NS}supported-report-set"))
+    names = " ".join(node.tag for node in root.iter())
+    supported = bool(token) or "sync-collection" in reports or "sync-collection" in names
+    return supported, token, ctag
+
+
+def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[dict], list[str], bool]:
+    root = ET.fromstring(xml_bytes)
+    token = ""
+    for node in root.iter(f"{DAV_NS}sync-token"):
+        if (node.text or "").strip():
+            token = (node.text or "").strip()
+    changed = []
+    removed = []
+    truncated = False
+    for response in root.iter(f"{DAV_NS}response"):
+        href = (response.findtext(f"{DAV_NS}href") or "").strip()
+        if not href:
+            continue
+        absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
+        status_text = " ".join((node.text or "") for node in response.iter(f"{DAV_NS}status"))
+        if "404" in status_text:
+            removed.append(href_event_uid(absolute))
+            continue
+        if "507" in status_text:
+            truncated = True
+            continue
+        calendar_data = ""
+        for node in response.iter(f"{CALDAV_NS}calendar-data"):
+            calendar_data = "".join(node.itertext()).strip()
+            if calendar_data:
+                break
+        changed.append({"href": absolute, "uid": href_event_uid(absolute), "ics": calendar_data})
+    return token, changed, removed, truncated
+
+
+def event_sync_keys(event: dict | None) -> set[str]:
+    keys = set()
+    for field in ("uid", "hrefUid"):
+        value = str((event or {}).get(field) or "")
+        if value:
+            keys.add(value)
+    return keys
+
+
+def apply_sync_delta(cached_events: list, removed_uids: list, new_events: list, keep_uids: list | None = None, drop_uids: list | None = None) -> list:
+    replaced = {str(uid) for uid in removed_uids if uid}
+    drop = {str(uid) for uid in (drop_uids or []) if uid}
+    keep = {str(uid) for uid in (keep_uids or []) if uid} - drop
+    for event in new_events:
+        replaced |= event_sync_keys(event)
+    replaced -= keep
+    replaced |= drop
+    kept = [event for event in cached_events if event_sync_keys(event).isdisjoint(replaced)]
+    added = [event for event in new_events if event_sync_keys(event).isdisjoint(drop)]
+    return kept + added
+
+
+def ecal_components_from_ics(ics_text: str, modules: EdsModules) -> list:
+    text = str(ics_text or "").strip()
+    if not text:
+        return []
+    if "BEGIN:VCALENDAR" not in text.upper():
+        text = "BEGIN:VCALENDAR\r\n" + text + "\r\nEND:VCALENDAR\r\n"
+    try:
+        component = modules.ECal.Component.new_from_string(text)
+    except Exception:
+        component = None
+    if component is not None:
+        return [component]
+    try:
+        root = modules.ICalGLib.Component.new_from_string(text)
+    except Exception:
+        return []
+    if root is None:
+        return []
+    kind = modules.ICalGLib.ComponentKind.VEVENT_COMPONENT
+    name = str(root.get_component_name() or "").upper() if hasattr(root, "get_component_name") else ""
+    nodes = []
+    if name == "VEVENT":
+        nodes = [root]
+    else:
+        child = root.get_first_component(kind)
+        while child is not None:
+            nodes.append(child)
+            child = root.get_next_component(kind)
+    components = []
+    for node in nodes:
+        item = None
+        try:
+            item = modules.ECal.Component.new_from_icalcomponent(node)
+        except Exception:
+            item = None
+        if item is None and hasattr(node, "as_ical_string"):
+            try:
+                item = modules.ECal.Component.new_from_string(node.as_ical_string())
+            except Exception:
+                item = None
+        if item is not None:
+            components.append(item)
+    return components
+
+
+def events_from_ics(ics_text: str, calendar: dict, client, modules: EdsModules, window_start: datetime, window_end: datetime) -> tuple[list, bool]:
+    components = ecal_components_from_ics(ics_text, modules)
+    if not components:
+        return [], False
+    events: list = []
+    incomplete = False
+    for component in components:
+        before = len(events)
+        append_component_events(client, component, calendar, window_start, window_end, events, modules)
+        recurring = hasattr(component, "has_recurrences") and component.has_recurrences()
+        if len(events) == before or (recurring and client is None):
+            incomplete = True
+    return events, bool(events) and not incomplete
+
+
+def ics_missing_vevent(ics_text: str) -> bool:
+    return "BEGIN:VEVENT" not in str(ics_text or "").upper()
+
+
+def ingest_changed_items(changed: list, calendar: dict, client, modules: EdsModules, window_start: datetime, window_end: datetime, username: str, password: str) -> tuple[list, list]:
+    new_events = []
+    failed_uids = []
+    for item in changed:
+        ics = item.get("ics") or ""
+        if ics_missing_vevent(ics) and item.get("href"):
+            _status, raw, _hdrs = caldav_http("GET", item["href"], username, password, b"", {})
+            if _status == 200:
+                ics = raw.decode("utf-8", "replace")
+            else:
+                sync_log("sync-ics-get-failed", href=str(item.get("href") or "")[:160], status=_status)
+        parsed, complete = events_from_ics(ics, calendar, client, modules, window_start, window_end)
+        href_uid = str(item.get("uid") or "")
+        if complete and parsed:
+            for event in parsed:
+                if href_uid:
+                    event["hrefUid"] = href_uid
+            new_events.extend(parsed)
+        else:
+            sync_log("sync-ics-parse-failed", hrefUid=href_uid, hasVevent=not ics_missing_vevent(ics), bytes=len(ics or ""))
+            if href_uid:
+                failed_uids.append(href_uid)
+            failed_uids.extend(str(event.get("uid") or "") for event in parsed if event.get("uid"))
+    return new_events, failed_uids
+
+
+def sync_state_map(cache: dict | None) -> dict:
+    state = (cache or {}).get("syncState") or {}
+    return state if isinstance(state, dict) else {}
+
+
+def mark_sync_unsupported(state: dict, calendar_id: str) -> None:
+    previous = state.get(calendar_id) if isinstance(state.get(calendar_id), dict) else {}
+    state[calendar_id] = {"supported": False, "token": "", "ctag": str(previous.get("ctag") or "")}
+
+
+def remember_sync_state(state: dict, calendar_id: str, **fields) -> dict:
+    current = dict(state.get(calendar_id) if isinstance(state.get(calendar_id), dict) else {})
+    current.update(fields)
+    state[calendar_id] = current
+    return current
+
+
+def ctag_decision(state: dict, calendar_id: str, ctag: str, if_changed: bool) -> str:
+    current = state.get(calendar_id) if isinstance(state.get(calendar_id), dict) else {}
+    old = str(current.get("ctag") or "")
+    if ctag and old and ctag == old:
+        sync_log("sync-ctag-unchanged", calendarId=calendar_id, ctag=ctag)
+        return "unchanged"
+    if ctag:
+        remember_sync_state(state, calendar_id, ctag=ctag)
+    if if_changed and (not ctag or not old):
+        sync_log("sync-ctag-baseline", calendarId=calendar_id, ctag=ctag)
+        return "unchanged"
+    sync_log("sync-ctag-changed", calendarId=calendar_id, ctag=ctag, previous=old, ifChanged=if_changed)
+    return "eds"
+
+
+def apply_collection_report(href: str, username: str, password: str, token: str, calendar: dict, client, source, modules: EdsModules, window_start: datetime, window_end: datetime, cache: dict | None, state: dict, calendar_id: str, ctag: str, cached_events: list, if_changed: bool, replace: bool = False) -> tuple[str, list, list]:
+    body = SYNC_REPORT_BODY.format(token=token.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")).encode("utf-8")
+    status, payload, _headers = caldav_http("REPORT", href, username, password, body, {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"})
+    if status in (403, 409, 412):
+        remember_sync_state(state, calendar_id, supported=True, token="", ctag=ctag)
+        sync_log("sync-6578-reset", calendarId=calendar_id, status=status, ifChanged=if_changed)
+        return "eds", [], []
+    if status in (415, 501):
+        mark_sync_unsupported(state, calendar_id)
+        if if_changed:
+            return ctag_decision(state, calendar_id, ctag, True), [], []
+        return "eds", [], []
+    if status not in (200, 207):
+        return (("unchanged", [], []) if if_changed else ("eds", [], []))
+    try:
+        next_token, changed, removed, truncated = parse_sync_collection(payload, href)
+    except ET.ParseError:
+        return "eds", [], []
+    remote_uids = [str(uid) for uid in removed if uid]
+    remote_uids.extend(str(item.get("uid") or "") for item in changed if item.get("uid"))
+    if cache is not None:
+        removed_map = cache.get("_removed") if isinstance(cache.get("_removed"), dict) else {}
+        removed_map[calendar_id] = [str(uid) for uid in removed if uid]
+        cache["_removed"] = removed_map
+    if truncated:
+        sync_log("sync-6578-truncated", calendarId=calendar_id, token=token)
+        return (("unchanged", [], remote_uids) if if_changed else ("eds", [], remote_uids))
+    parse_client = client
+    if changed and parse_client is None and source is not None:
+        try:
+            parse_client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 10, None)
+        except Exception:
+            parse_client = None
+    new_events, failed_uids = ingest_changed_items(changed, calendar, parse_client, modules, window_start, window_end, username, password)
+    remote_uids.extend(str(event.get("uid") or "") for event in new_events if event.get("uid"))
+    drop_uids = deleted_touch_keys(cache, calendar_id)
+    failed_keep = [uid for uid in failed_uids if uid not in drop_uids]
+    if failed_uids:
+        sync_log("sync-6578-parse-failed", calendarId=calendar_id, failed=failed_uids[:8], changed=len(changed))
+        if replace:
+            return (("unchanged", [], remote_uids) if if_changed else ("eds", [], remote_uids))
+        return "updated", apply_sync_delta(cached_events, removed, new_events, keep_uids=failed_keep, drop_uids=drop_uids), remote_uids
+    if next_token:
+        remember_sync_state(state, calendar_id, supported=True, token=next_token, ctag=ctag or next_token, filled=True)
+        if cache is not None:
+            cache["syncState"] = state
+    if replace:
+        sync_log("sync-6578-full", calendarId=calendar_id, pulled=len(new_events), token=next_token or token)
+        return "updated", new_events, remote_uids
+    if not changed and not removed:
+        sync_log("sync-6578-unchanged", calendarId=calendar_id, token=next_token or token)
+        return "unchanged", [], remote_uids
+    merged = apply_sync_delta(cached_events, removed, new_events, keep_uids=failed_keep, drop_uids=drop_uids)
+    sync_log("sync-6578-updated", calendarId=calendar_id, changed=len(changed), removed=removed, token=next_token or token)
+    return "updated", merged, remote_uids
+
+
+def caldav_sync_calendar(source, registry, modules: EdsModules, calendar: dict, client, cache: dict | None, window_start: datetime, window_end: datetime, if_changed: bool = False) -> tuple[str, list, list]:
+    calendar_id = calendar["id"]
+    state = sync_state_map(cache)
+    current = state.get(calendar_id) if isinstance(state.get(calendar_id), dict) else {}
+    href = source_webdav_url(source, modules)
+    username, password = lookup_source_credentials(source, registry, modules)
+    cached_events = [event for event in ((cache or {}).get("events") or []) if (event or {}).get("calendarId") == calendar_id]
+    fe = is_forwardemail_host(str(calendar.get("host") or ""))
+    if not href or not username or not password:
+        sync_log("sync-skip-no-creds", calendarId=calendar_id, ifChanged=if_changed)
+        return (("unchanged", [], []) if if_changed else ("eds", [], []))
+    token = str(current.get("token") or "")
+    ctag = str(current.get("ctag") or "")
+    if cache is not None:
+        cache["syncState"] = state
+    if current.get("supported") is True and token:
+        pass
+    else:
+        status, body, _headers = caldav_http("PROPFIND", href, username, password, SYNC_PROBE_BODY, {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"})
+        supported, probed_token, ctag = parse_sync_probe(body) if status in (200, 207) else (False, "", "")
+        if cache is not None:
+            cache["syncState"] = state
+        if current.get("supported") is False or (status in (200, 207) and not supported and current.get("supported") is not True):
+            mark_sync_unsupported(state, calendar_id)
+            if ctag:
+                remember_sync_state(state, calendar_id, supported=False, ctag=ctag)
+            return ctag_decision(state, calendar_id, ctag, if_changed), [], []
+        token = str(current.get("token") or "")
+        if current.get("supported") is not True:
+            if status not in (200, 207) or not supported:
+                mark_sync_unsupported(state, calendar_id)
+                if ctag:
+                    remember_sync_state(state, calendar_id, supported=False, ctag=ctag)
+                if if_changed:
+                    return ctag_decision(state, calendar_id, ctag, True), [], []
+                return "eds", [], []
+            remember_sync_state(state, calendar_id, supported=True, token=token or probed_token, ctag=ctag)
+            sync_log("sync-6578-first", calendarId=calendar_id, ifChanged=if_changed, token=token or probed_token, ctag=ctag)
+            if fe:
+                return apply_collection_report(href, username, password, "", calendar, client, source, modules, window_start, window_end, cache, state, calendar_id, ctag, cached_events, if_changed, replace=True)
+            if if_changed:
+                return "unchanged", [], []
+            return "eds", [], []
+    if fe and (not token or (not cached_events and current.get("filled") is not True)):
+        sync_log("sync-6578-recover", calendarId=calendar_id, cached=len(cached_events), token=token)
+        return apply_collection_report(href, username, password, "", calendar, client, source, modules, window_start, window_end, cache, state, calendar_id, ctag, cached_events, if_changed, replace=True)
+    if not token:
+        if if_changed:
+            return "unchanged", [], []
+        return "eds", [], []
+    result = apply_collection_report(href, username, password, token, calendar, client, source, modules, window_start, window_end, cache, state, calendar_id, ctag, cached_events, if_changed)
+    if result[0] == "eds" and fe:
+        remember_sync_state(state, calendar_id, supported=True, token="", ctag=ctag)
+        sync_log("sync-6578-recover", calendarId=calendar_id, reason="eds-fallback")
+        return apply_collection_report(href, username, password, "", calendar, client, source, modules, window_start, window_end, cache, state, calendar_id, ctag, cached_events, if_changed, replace=True)
+    return result
+
+
+def eds_pull_calendar_events(client, calendar: dict, window_start: datetime, window_end: datetime, modules: EdsModules, events: list) -> None:
+    query = eds_range_query(window_start, window_end)
+    ok, components = client.get_object_list_as_comps_sync(query, None)
+    if not ok:
+        return
+    for component in components or []:
+        if len(events) >= MAX_EVENTS:
+            break
+        append_component_events(client, component, calendar, window_start, window_end, events, modules)
+    if len(events) > MAX_EVENTS:
+        del events[MAX_EVENTS:]
+
+
+def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if_changed: bool = False) -> dict:
     try:
         modules = load_eds_modules()
         registry = modules.EDataServer.SourceRegistry.new_sync(None)
@@ -884,11 +1506,16 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) ->
     events = []
     errors = []
     eds_prune_duplicate_caldav(registry, modules)
+    cache = read_cache() or {"ok": True, "calendars": [], "events": [], "syncState": {}}
+    start_rev = cache_rev(cache)
+    start_state = json.loads(json.dumps(sync_state_map(cache)))
+    calendar_modes: dict[str, str] = {}
+    remote_touches: dict[str, list] = {}
+    sync_log("snapshot-start", ifChanged=if_changed, includeEvents=include_events, rev=start_rev)
     sources = list(registry.list_sources(modules.EDataServer.SOURCE_EXTENSION_CALENDAR))
     sources.sort(key=lambda item: (0 if is_omarchy_source_uid(item.get_uid()) else 1, item.get_display_name() or ""))
     window_start = min(start, datetime.now(UTC) - timedelta(days=400))
     window_end = max(end, datetime.now(UTC) + timedelta(days=400))
-    query = eds_range_query(window_start, window_end)
     seen_caldav = set()
 
     for source in sources:
@@ -902,25 +1529,52 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) ->
                 continue
             seen_caldav.add(key)
         calendar = source_calendar(source, registry, modules)
+        listed = False
+        client = None
         try:
-            client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 3, None)
-            calendar["readonly"] = bool(client.is_readonly())
             calendars.append(calendar)
+            listed = True
             if not include_events:
                 continue
-            ok, components = client.get_object_list_as_comps_sync(query, None)
-            if not ok:
-                errors.append({"calendarId": calendar["id"], "code": "query-failed", "message": "EDS query returned false."})
+            mode, synced, remote_uids = ("eds", [], [])
+            if source_provider(source, registry, modules) == "caldav":
+                try:
+                    mode, synced, remote_uids = caldav_sync_calendar(source, registry, modules, calendar, None, cache, window_start, window_end, if_changed)
+                except Exception as error:
+                    sync_log("sync-calendar-error", calendarId=calendar.get("id"), error=str(error)[:200], ifChanged=if_changed)
+                    mode, synced, remote_uids = (("unchanged", [], []) if if_changed else ("eds", [], []))
+            calendar_modes[calendar["id"]] = mode
+            remote_touches[calendar["id"]] = remote_uids
+            cached_for_cal = [event for event in (cache.get("events") or []) if (event or {}).get("calendarId") == calendar["id"]]
+            sync_log("sync-calendar", calendarId=calendar["id"], name=calendar.get("name"), host=calendar.get("host"), mode=mode, ifChanged=if_changed, cached=len(cached_for_cal))
+            if mode == "unchanged":
+                calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly")
+                events.extend(cached_for_cal)
                 continue
-            for component in components or []:
-                if len(events) >= MAX_EVENTS:
-                    break
-                append_component_events(client, component, calendar, window_start, window_end, events, modules)
-            if len(events) > MAX_EVENTS:
-                del events[MAX_EVENTS:]
+            if mode == "updated":
+                calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly")
+                events.extend(synced)
+                continue
+            client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 10, None)
+            calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else bool(client.is_readonly())
+            host = str(calendar.get("host") or "")
+            if not is_forwardemail_host(host) and hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
+                try:
+                    client.refresh_sync(None)
+                    sync_log("sync-eds-refresh", calendarId=calendar["id"])
+                except Exception as error:
+                    sync_log("sync-eds-refresh-failed", calendarId=calendar["id"], error=str(error)[:200])
+            before = len(events)
+            eds_pull_calendar_events(client, calendar, window_start, window_end, modules, events)
+            sync_log("sync-eds-pull", calendarId=calendar["id"], pulled=len(events) - before)
         except Exception as error:
+            calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else True
+            if not listed:
+                calendars.append(calendar)
             errors.append({"calendarId": calendar["id"], "code": "calendar-error", "message": str(error)})
 
+    if len(events) > MAX_EVENTS:
+        del events[MAX_EVENTS:]
     payload = {
         "ok": True,
         "provider": "evolution-data-server",
@@ -928,10 +1582,15 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True) ->
         "events": events,
         "cached": False,
         "range": {"start": iso(window_start), "end": iso(window_end)},
+        "syncState": sync_state_map(cache),
     }
     if errors:
         payload["warnings"] = errors
     if include_events:
+        payload["_modes"] = calendar_modes
+        payload["_remote"] = remote_touches
+        payload["_removed"] = cache.get("_removed") if isinstance(cache.get("_removed"), dict) else {}
+        payload = adopt_newer_cache_events(payload, start_rev, calendar_modes, remote_touches, start_state, payload["_removed"])
         write_cache(payload)
     return payload
 
@@ -955,6 +1614,17 @@ def parse_event_instant(value: str) -> datetime | None:
         return parse_instant(text)
     except Exception:
         return None
+
+
+def sync_log(message: str, **fields) -> None:
+    try:
+        path = cache_dir() / "sync.log"
+        line = {"at": iso(datetime.now(UTC)), "message": message}
+        line.update(fields)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(line, separators=(",", ":")) + "\n")
+    except Exception:
+        return
 
 
 def cache_dir() -> Path:
@@ -1059,9 +1729,152 @@ def write_reminders(payload: dict) -> dict:
     return {"ok": True, "minutes": minutes, "fired": data["fired"]}
 
 
-def write_cache(payload: dict) -> None:
+def cache_rev(cache: dict | None) -> int:
+    try:
+        return int((cache or {}).get("rev") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def local_touch_map(cache: dict | None) -> dict:
+    raw = (cache or {}).get("localTouches") if isinstance((cache or {}).get("localTouches"), dict) else {}
+    mapped: dict[str, dict[str, str]] = {}
+    for calendar_id, value in raw.items():
+        cal_id = str(calendar_id or "")
+        if not cal_id:
+            continue
+        if isinstance(value, dict):
+            mapped[cal_id] = {str(uid): str(op or "delete") for uid, op in value.items() if uid}
+        elif isinstance(value, list):
+            mapped[cal_id] = {str(uid): "delete" for uid in value if uid}
+    return mapped
+
+
+def note_local_touch(cache: dict, calendar_id: str, uid: str, op: str = "delete") -> None:
+    cal_id = str(calendar_id or "")
+    event_uid = str(uid or "")
+    if not cal_id or not event_uid:
+        return
+    touches = local_touch_map(cache)
+    current = dict(touches.get(cal_id) or {})
+    current[event_uid] = str(op or "delete")
+    touches[cal_id] = current
+    cache["localTouches"] = touches
+
+
+def note_event_touch(cache: dict, event: dict | None, op: str = "delete") -> None:
+    if not event:
+        return
+    calendar_id = str(event.get("calendarId") or "")
+    note_local_touch(cache, calendar_id, str(event.get("uid") or ""), op)
+    note_local_touch(cache, calendar_id, str(event.get("hrefUid") or ""), op)
+
+
+def deleted_touch_keys(cache: dict | None, calendar_id: str) -> list:
+    ops = local_touch_map(cache).get(str(calendar_id or ""), {})
+    return [uid for uid, op in ops.items() if op == "delete"]
+
+
+def touch_keys(touches: dict, calendar_id: str) -> set[str]:
+    return {str(uid) for uid in (touches.get(calendar_id) or {}) if uid}
+
+
+def prune_local_touches(touches: dict, removed_by_cal: dict, listed_by_cal: dict | None = None) -> dict:
+    remaining: dict[str, dict[str, str]] = {}
+    for calendar_id, ops in (touches or {}).items():
+        removed = {str(uid) for uid in (removed_by_cal.get(calendar_id) or []) if uid}
+        listed = {str(uid) for uid in (listed_by_cal or {}).get(calendar_id) or [] if uid}
+        kept = {}
+        for uid, op in (ops or {}).items():
+            if op == "delete" and uid in removed:
+                continue
+            if op == "create" and uid in listed:
+                continue
+            kept[str(uid)] = str(op)
+        if kept:
+            remaining[str(calendar_id)] = kept
+    return remaining
+
+
+def events_by_calendar(events: list) -> dict:
+    grouped: dict[str, list] = {}
+    for event in events or []:
+        cal_id = str((event or {}).get("calendarId") or "")
+        grouped.setdefault(cal_id, []).append(event)
+    return grouped
+
+
+def merge_snapshot_with_local(snapshot_events: list, disk: dict | None, modes: dict, remote_uids: dict, sync_state: dict, start_state: dict) -> list:
+    disk = disk if isinstance(disk, dict) else {}
+    touches = local_touch_map(disk)
+    disk_by = events_by_calendar(disk.get("events") or [])
+    snap_by = events_by_calendar(snapshot_events)
+    merged = []
+    for cal_id in set(disk_by) | set(snap_by) | set(modes) | set(touches):
+        local_uids = touch_keys(touches, cal_id)
+        deleted = {uid for uid, op in (touches.get(cal_id) or {}).items() if op == "delete"}
+        mode = str(modes.get(cal_id) or "unchanged")
+        disk_events = disk_by.get(cal_id) or []
+        snap_events = snap_by.get(cal_id) or []
+        if mode == "unchanged":
+            merged.extend(disk_events or snap_events)
+            continue
+        remote_changed = {str(uid) for uid in (remote_uids.get(cal_id) or []) if uid}
+        if deleted & remote_changed:
+            previous = start_state.get(cal_id)
+            if isinstance(previous, dict):
+                sync_state[cal_id] = dict(previous)
+            else:
+                sync_state.pop(cal_id, None)
+            sync_log("snapshot-hold-token", calendarId=cal_id, uids=sorted(deleted & remote_changed))
+        merged.extend([event for event in snap_events if event_sync_keys(event).isdisjoint(local_uids)])
+        merged.extend([event for event in disk_events if not event_sync_keys(event).isdisjoint(local_uids)])
+    return merged
+
+
+def adopt_newer_cache_events(payload: dict, start_rev: int, modes: dict | None = None, remote_uids: dict | None = None, start_state: dict | None = None, removed_uids: dict | None = None) -> dict:
+    disk = read_cache()
+    next_payload = dict(payload)
+    touches = local_touch_map(disk)
+    if cache_rev(disk) > start_rev or touches:
+        state = next_payload.get("syncState") if isinstance(next_payload.get("syncState"), dict) else {}
+        next_payload["events"] = merge_snapshot_with_local(next_payload.get("events") or [], disk, modes or {}, remote_uids or {}, state, start_state or {})
+        next_payload["syncState"] = state
+        next_payload["rev"] = max(start_rev, cache_rev(disk))
+        present = {}
+        for event in next_payload["events"]:
+            cal_id = str((event or {}).get("calendarId") or "")
+            present.setdefault(cal_id, set()).update(event_sync_keys(event))
+        next_payload["localTouches"] = prune_local_touches(touches, removed_uids or {}, present)
+        sync_log("snapshot-keep-local", startRev=start_rev, diskRev=cache_rev(disk), events=len(next_payload["events"]), touches=next_payload["localTouches"])
+    else:
+        next_payload["rev"] = start_rev
+        next_payload["localTouches"] = touches
+    return next_payload
+
+
+def write_cache(payload: dict, bump: bool = False) -> None:
     path = cache_file()
     tmp = path.with_suffix(".json.tmp")
+    disk = None if bump else read_cache()
+    if disk is not None and cache_rev(disk) > cache_rev(payload):
+        payload = dict(payload)
+        state = payload.get("syncState") if isinstance(payload.get("syncState"), dict) else {}
+        payload["events"] = merge_snapshot_with_local(
+            payload.get("events") or [],
+            disk,
+            payload.get("_modes") if isinstance(payload.get("_modes"), dict) else {},
+            payload.get("_remote") if isinstance(payload.get("_remote"), dict) else {},
+            state,
+            {},
+        )
+        payload["syncState"] = state
+        payload["localTouches"] = prune_local_touches(local_touch_map(disk), payload.get("_removed") if isinstance(payload.get("_removed"), dict) else {}, None)
+        payload["rev"] = cache_rev(disk)
+        sync_log("cache-keep-newer", diskRev=cache_rev(disk), payloadRev=cache_rev(payload))
+    rev = cache_rev(payload)
+    if bump:
+        rev = max(rev, cache_rev(read_cache())) + 1
     data = {
         "ok": True,
         "provider": payload.get("provider") or "evolution-data-server",
@@ -1069,6 +1882,9 @@ def write_cache(payload: dict) -> None:
         "events": bound_items(payload.get("events"), MAX_EVENTS),
         "cachedAt": iso(datetime.now(UTC)),
         "range": payload.get("range") or {},
+        "syncState": payload.get("syncState") if isinstance(payload.get("syncState"), dict) else {},
+        "rev": rev,
+        "localTouches": local_touch_map(payload),
     }
     raw = json.dumps(data, separators=(",", ":"))
     while len(raw.encode("utf-8")) > MAX_CACHE_BYTES and data["events"]:
@@ -1130,14 +1946,46 @@ def cached_snapshot(start: datetime, end: datetime, provider: str) -> dict:
     }
 
 
-def merge_cache_event(event: dict) -> None:
+def merge_cache_calendars(added: list) -> None:
+    cache = read_cache() or {"ok": True, "provider": "evolution-data-server", "calendars": [], "events": []}
+    existing = {str(item.get("id") or ""): item for item in (cache.get("calendars") or []) if item}
+    for calendar in added or []:
+        if calendar and calendar.get("id"):
+            existing[str(calendar["id"])] = calendar
+    cache["calendars"] = list(existing.values())
+    write_cache(cache, bump=True)
+
+
+def merge_cache_event(event: dict, series: bool = False) -> None:
     if not event or not event.get("id"):
         return
     cache = read_cache() or {"ok": True, "provider": "evolution-data-server", "calendars": [], "events": []}
-    events = [existing for existing in (cache.get("events") or []) if existing.get("id") != event.get("id")]
-    events.append(event)
-    cache["events"] = events
-    write_cache(cache)
+    note_event_touch(cache, event, "create")
+    if series:
+        updated = []
+        found = False
+        for existing in cache.get("events") or []:
+            if existing.get("uid") == event.get("uid") and existing.get("calendarId") == event.get("calendarId"):
+                found = True
+                next_event = dict(existing)
+                for key in ("title", "location", "description", "calendarName", "calendarColor"):
+                    if key in event:
+                        next_event[key] = event[key]
+                if existing.get("id") == event.get("id") or not existing.get("rid"):
+                    for key in ("start", "end", "allDay", "id"):
+                        if key in event:
+                            next_event[key] = event[key]
+                updated.append(next_event)
+            else:
+                updated.append(existing)
+        if not found:
+            updated.append(event)
+        cache["events"] = updated
+    else:
+        events = [existing for existing in (cache.get("events") or []) if existing.get("id") != event.get("id")]
+        events.append(event)
+        cache["events"] = events
+    write_cache(cache, bump=True)
 
 
 def apply_calendar_overrides_to_cache(updates: list) -> None:
@@ -1257,8 +2105,14 @@ def remove_cache_event(event_id: str) -> None:
     cache = read_cache()
     if not cache or not event_id:
         return
-    cache["events"] = [existing for existing in (cache.get("events") or []) if existing.get("id") != event_id]
-    write_cache(cache)
+    remaining = []
+    for existing in cache.get("events") or []:
+        if existing.get("id") == event_id:
+            note_event_touch(cache, existing, "delete")
+            continue
+        remaining.append(existing)
+    cache["events"] = remaining
+    write_cache(cache, bump=True)
 
 
 def main(argv: list[str]) -> int:
@@ -1280,6 +2134,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--meeting-url", default="")
     parser.add_argument("--meeting-kind", default="none")
     parser.add_argument("--from-cache", action="store_true")
+    parser.add_argument("--if-changed", action="store_true")
     args = parser.parse_args(argv)
 
     start = parse_instant(args.start)
@@ -1346,7 +2201,7 @@ def main(argv: list[str]) -> int:
         payload = mock_snapshot(start, end)
         write_cache(payload)
     elif args.provider in ("eds", "evolution-data-server"):
-        payload = eds_snapshot(start, end, args.operation != "list-calendars")
+        payload = eds_snapshot(start, end, args.operation != "list-calendars", args.if_changed)
     else:
         payload = {
             "ok": False,

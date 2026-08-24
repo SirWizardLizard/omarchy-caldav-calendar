@@ -139,3 +139,179 @@ assert mod.is_omarchy_collection_child(Child("c3742f32c586dbe48f75eeb097fe4ed289
 assert not mod.is_omarchy_collection_child(Child("evolution-icloud", None))
 assert not mod.is_omarchy_collection_child(Child("omarchy-calendar-caldav-own", "omarchy-calendar-caldav-parent"))
 print("ok - helper omarchy calendar uid")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+assert mod.normalize_caldav_url("caldav.forwardemail.net") == "https://caldav.forwardemail.net"
+fwd = mod.caldav_candidate_urls("https://caldav.forwardemail.net", "user@example.com")
+assert fwd[0] == "https://caldav.forwardemail.net/dav/user@example.com/"
+assert "https://caldav.forwardemail.net/dav/" in fwd
+typed = mod.caldav_candidate_urls("https://caldav.forwardemail.net/dav/", "user@example.com")
+assert typed == ["https://caldav.forwardemail.net/dav/"]
+xml = b"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/dav/user@example.com/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <c:calendar-home-set><d:href>/dav/user@example.com/</d:href></c:calendar-home-set>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/user@example.com/default/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"""
+calendars, homes, _principals = mod.parse_caldav_multistatus(xml, "https://caldav.forwardemail.net/dav/user@example.com/")
+assert any(item["name"] == "Personal" and item["href"].endswith("/default/") for item in calendars)
+assert any(item.endswith("/dav/user@example.com/") for item in homes)
+print("ok - helper forwardemail propfind parse")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+probe = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>
+<d:sync-token>http://example.com/ns/sync/1</d:sync-token>
+<d:supported-report-set><d:supported-report><d:report><d:sync-collection/></d:report></d:supported-report></d:supported-report-set>
+</d:prop></d:propstat></d:response></d:multistatus>"""
+supported, token = mod.parse_sync_support(probe)
+assert supported is True
+assert token.endswith("/1")
+xml = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response><d:href>/dav/cal/abc.ics</d:href><d:propstat><d:prop><d:getetag>1</d:getetag><c:calendar-data>BEGIN:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/dav/cal/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>
+  <d:sync-token>http://example.com/ns/sync/2</d:sync-token>
+</d:multistatus>"""
+next_token, changed, removed, truncated = mod.parse_sync_collection(xml, "https://caldav.example.com/dav/cal/")
+assert next_token.endswith("/2")
+assert changed[0]["uid"] == "abc" and "BEGIN:VCALENDAR" in changed[0]["ics"]
+assert removed == ["gone"]
+assert truncated is False
+trunc = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/cal/x.ics</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response><d:sync-token>http://example.com/ns/sync/3</d:sync-token></d:multistatus>"""
+_tok, _ch, _rm, truncated = mod.parse_sync_collection(trunc, "https://caldav.example.com/dav/cal/")
+assert truncated is True
+merged = mod.apply_sync_delta(
+  [{"uid": "series", "rid": "1"}, {"uid": "series", "rid": "2"}, {"uid": "keep", "rid": ""}, {"uid": "gone", "rid": ""}],
+  ["gone"],
+  [{"uid": "series", "rid": "1"}, {"uid": "series", "rid": "3"}],
+)
+assert [event["uid"] + event["rid"] for event in merged] == ["keep", "series1", "series3"]
+kept_failed = mod.apply_sync_delta(
+  [{"uid": "series", "rid": "1"}, {"uid": "series", "rid": "2"}],
+  [],
+  [],
+  keep_uids=["series"],
+)
+assert [event["rid"] for event in kept_failed] == ["1", "2"]
+href_merged = mod.apply_sync_delta(
+  [{"uid": "1787612053560@forwardemail.net", "hrefUid": "6a8ccb95dd03a22af4200787", "rid": ""}],
+  ["6a8ccb95dd03a22af4200787"],
+  [],
+)
+assert href_merged == []
+dropped = mod.apply_sync_delta(
+  [{"uid": "08749FFE", "hrefUid": "A5C7D016", "rid": ""}],
+  [],
+  [{"uid": "08749FFE", "hrefUid": "A5C7D016", "rid": ""}],
+  keep_uids=["A5C7D016"],
+  drop_uids=["08749FFE"],
+)
+assert dropped == []
+cache = {"localTouches": {"cal": {"08749FFE": "delete", "A5C7D016": "delete"}}}
+assert set(mod.deleted_touch_keys(cache, "cal")) == {"08749FFE", "A5C7D016"}
+pruned = mod.prune_local_touches({"cal": {"08749FFE": "delete", "A5C7D016": "delete", "new": "create"}}, {"cal": ["A5C7D016"]}, {"cal": ["new"]})
+assert "A5C7D016" not in pruned.get("cal", {})
+assert "new" not in pruned.get("cal", {})
+assert pruned["cal"]["08749FFE"] == "delete"
+still = mod.prune_local_touches({"cal": {"08749FFE": "delete"}}, {}, None)
+assert still["cal"]["08749FFE"] == "delete"
+disk_del = {
+  "events": [],
+  "localTouches": {"cal": {"08749FFE": "delete", "A5C7D016": "delete"}},
+}
+snap_back = [{"uid": "08749FFE", "hrefUid": "A5C7D016", "calendarId": "cal", "title": "back"}]
+held = {}
+merged_del = mod.merge_snapshot_with_local(snap_back, disk_del, {"cal": "updated"}, {"cal": ["A5C7D016", "08749FFE"]}, held, {"cal": {"token": "old"}})
+assert merged_del == []
+assert held["cal"]["token"] == "old"
+folder = __import__("tempfile").mkdtemp()
+__import__("os").environ["OMARCHY_CALENDAR_CACHE"] = folder
+disk_events = [
+  {"id": "a1", "uid": "local", "calendarId": "fe", "title": "mine"},
+  {"id": "b1", "uid": "keep", "calendarId": "icloud", "title": "old"},
+]
+mod.write_cache({"ok": True, "calendars": [], "events": disk_events, "rev": 2, "localTouches": {"fe": ["local"]}})
+snap = [
+  {"id": "a0", "uid": "gone-remote", "calendarId": "fe", "title": "stale"},
+  {"id": "b2", "uid": "keep", "calendarId": "icloud", "title": "new"},
+]
+start_state = {"icloud": {"supported": True, "token": "old"}}
+state = {"icloud": {"supported": True, "token": "new"}, "fe": {"supported": True, "token": "fe2"}}
+merged_events = mod.merge_snapshot_with_local(snap, mod.read_cache(), {"fe": "updated", "icloud": "updated"}, {"fe": ["local"], "icloud": ["keep"]}, state, start_state)
+assert any(event["uid"] == "local" and event["title"] == "mine" for event in merged_events)
+assert any(event["uid"] == "keep" and event["title"] == "new" for event in merged_events)
+assert state["icloud"]["token"] == "new"
+# local UID conflict reverts that calendar token
+state = {"fe": {"supported": True, "token": "fe2"}}
+start_state = {"fe": {"supported": True, "token": "fe1"}}
+mod.merge_snapshot_with_local(snap, mod.read_cache(), {"fe": "updated"}, {"fe": ["local"]}, state, start_state)
+assert state["fe"]["token"] == "fe1"
+kept = mod.adopt_newer_cache_events({"ok": True, "calendars": [], "events": [{"id": "stale", "uid": "x", "calendarId": "fe"}], "syncState": {}}, 1, {"fe": "unchanged"}, {}, {})
+assert any(event["uid"] == "local" for event in kept["events"])
+assert kept.get("localTouches", {}).get("fe", {}).get("local") == "delete"
+mod.write_cache({"ok": True, "calendars": [], "events": [{"id": "gone"}], "rev": 2, "localTouches": {"fe": {"local": "delete"}}}, bump=True)
+stale = {"ok": True, "calendars": [], "events": [{"id": "stale-snap", "uid": "local", "calendarId": "fe"}], "rev": 2, "_modes": {"fe": "updated"}, "_remote": {"fe": ["local"]}}
+mod.write_cache(stale)
+after = mod.read_cache()
+assert not any(event.get("id") == "stale-snap" for event in after["events"])
+assert mod.href_event_uid("/dav/user/cal/meet%40ing.ics") == "meet@ing"
+probe = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:response><d:propstat><d:prop>
+<cs:getctag>abc</cs:getctag>
+</d:prop></d:propstat></d:response></d:multistatus>"""
+supported, token, ctag = mod.parse_sync_probe(probe)
+assert supported is False and ctag == "abc"
+state = {}
+assert mod.ctag_decision(state, "cal", "abc", True) == "unchanged"
+assert mod.ctag_decision(state, "cal", "abc", True) == "unchanged"
+assert mod.ctag_decision(state, "cal", "xyz", True) == "eds"
+print("ok - helper rfc6578 sync-collection parse")' "$ROOT/helper/omarchy-calendar-helper"
+
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+from datetime import UTC, datetime, timedelta
+mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
+try:
+    modules = mod.load_eds_modules()
+except Exception:
+    print("ok - helper forwardemail ics parse skipped")
+    raise SystemExit(0)
+ics = """BEGIN:VCALENDAR\r
+VERSION:2.0\r
+BEGIN:VTIMEZONE\r
+TZID:America/Chicago\r
+BEGIN:STANDARD\r
+DTSTART:19701101T020000\r
+TZOFFSETFROM:-0600\r
+TZOFFSETTO:-0600\r
+END:STANDARD\r
+END:VTIMEZONE\r
+BEGIN:VEVENT\r
+UID:1787612053560@forwardemail.net\r
+DTSTART;TZID=America/Chicago:20260824T000000\r
+DTEND;TZID=America/Chicago:20260824T010000\r
+SUMMARY:Test event creation in forwardemail\r
+END:VEVENT\r
+END:VCALENDAR\r
+"""
+calendar = {"id": "fe", "name": "Calendar", "color": "#000", "provider": "caldav", "host": "caldav.forwardemail.net", "source": "x"}
+parsed, complete = mod.events_from_ics(ics, calendar, None, modules, datetime.now(UTC) - timedelta(days=400), datetime.now(UTC) + timedelta(days=400))
+assert complete is True
+assert parsed[0]["uid"] == "1787612053560@forwardemail.net"
+assert parsed[0]["title"] == "Test event creation in forwardemail"
+assert parsed[0]["start"] == "2026-08-24T05:00:00Z"
+print("ok - helper forwardemail ics parse")' "$ROOT/helper/omarchy-calendar-helper"

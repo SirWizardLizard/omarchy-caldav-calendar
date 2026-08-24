@@ -584,6 +584,7 @@ Panel {
       setupError = "Calendar service is not loaded."
       return
     }
+    if (calendarService.setupBusy) return
     if (setupKind === "local") {
       if (setupName === "") {
         setupError = "Give the calendar a name."
@@ -738,17 +739,18 @@ Panel {
     onTriggered: root.now = new Date()
   }
 
+  Timer {
+    interval: 20000
+    running: root.opened
+    repeat: true
+    onTriggered: { if (calendarService) calendarService.pollRemote() }
+  }
+
   Connections {
     target: calendarService
     function onEventSaved(ok, message) {
-      if (!root.creatingEvent) return
-      if (ok) {
-        root.creatingEvent = false
-        root.editingEvent = null
-        root.createError = ""
-      } else {
-        root.createError = message || "Could not save the event."
-      }
+      if (ok || root.creatingEvent) return
+      root.createError = message || "Could not save the event."
     }
     function onSetupFinished(ok, message) {
       if (ok) {

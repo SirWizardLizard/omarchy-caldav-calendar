@@ -552,6 +552,7 @@ function parseOperationResponse(text) {
       ok: parsed.ok === true,
       provider: String(parsed.provider || ''),
       calendar: parsed.calendar || null,
+      calendars: Array.isArray(parsed.calendars) ? parsed.calendars : (parsed.calendar ? [parsed.calendar] : []),
       event: parsed.event ? normalizedEvent(parsed.event) : null,
       uid: String(parsed.uid || (parsed.event && parsed.event.uid) || ''),
       signedIn: parsed.signedIn === true,
