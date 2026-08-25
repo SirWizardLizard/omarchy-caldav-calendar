@@ -835,34 +835,65 @@ Panel {
                 ViewButton { text: "Day"; selected: root.viewMode === "day"; onClicked: root.setView("day"); onDoubleClicked: { root.setView("day"); root.goToToday() } }
               }
 
-              Row {
+              Item {
                 id: titleNav
+                width: Style.space(260)
+                height: Math.max(previousButton.implicitHeight, titleColumn.implicitHeight, nextButton.implicitHeight)
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(8)
 
-                PanelActionButton { id: previousButton; iconText: "‹"; tooltipText: "Previous"; onClicked: root.movePeriod(-1) }
+                PanelActionButton {
+                  id: previousButton
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "‹"
+                  tooltipText: "Previous"
+                  onClicked: root.movePeriod(-1)
+                }
                 Column {
                   id: titleColumn
+                  anchors.left: previousButton.right
+                  anchors.right: nextButton.left
+                  anchors.leftMargin: Style.space(4)
+                  anchors.rightMargin: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(2)
 
                   Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: parent.width
                     text: root.headline
                     color: Color.foreground
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.heading
                     font.bold: true
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onDoubleClicked: root.goToToday()
+                    }
                   }
                   Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: parent.width
                     text: calendarService ? ((calendarService.syncing ? "Syncing" : (calendarService.lastSyncText === "Cached" || calendarService.lastSyncText === "Never synced" ? calendarService.lastSyncText : "Synced " + calendarService.lastSyncText)) + " · " + calendarService.calendars.length + " calendars") : "Calendar service not loaded"
                     color: Color.muted
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.bodySmall
                   }
                 }
-                PanelActionButton { id: nextButton; iconText: "›"; tooltipText: "Next"; onClicked: root.movePeriod(1) }
+                PanelActionButton {
+                  id: nextButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "›"
+                  tooltipText: "Next"
+                  onClicked: root.movePeriod(1)
+                }
               }
 
               Row {
