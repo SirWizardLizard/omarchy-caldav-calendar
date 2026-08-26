@@ -6,6 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 node "$ROOT/test/model-test.js"
 bash "$ROOT/test/helper-test.sh"
+bash "$ROOT/test/qml-test.sh"
 python3 "$ROOT/test/caldav-harness.py"
 bash "$ROOT/test/write-test.sh"
 

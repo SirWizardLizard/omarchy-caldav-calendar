@@ -796,6 +796,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: calendarsOut; waitForEnd: true }
@@ -814,6 +815,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: setupOut; waitForEnd: true }
@@ -842,6 +844,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
     stdout: StdioCollector { waitForEnd: true }
   }
