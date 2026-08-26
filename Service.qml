@@ -181,6 +181,7 @@ Item {
   }
 
   function finishSetup(text, exitCode) {
+    setupWatchdog.running = false
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
       root.status = "ready"
@@ -495,6 +496,7 @@ Item {
     if (reminderSaveProc.running) return
     reminderSaveProc.secret = JSON.stringify({ minutes: reminderMinutes, fired: Object.keys(firedReminders) })
     reminderSaveProc.command = [helperPath(), "reminders-save"]
+    reminderSaveProc.stdinEnabled = true
     reminderSaveProc.running = true
   }
 
@@ -545,6 +547,7 @@ Item {
     if (calendarsProc.running) calendarsProc.running = false
     calendarsProc.secret = JSON.stringify({ calendars: entries || [] })
     calendarsProc.command = [helperPath(), "update-calendars", "--provider", provider]
+    calendarsProc.stdinEnabled = true
     calendarsProc.running = true
   }
 
@@ -557,7 +560,9 @@ Item {
     if (setupProc.running) setupProc.running = false
     setupProc.secret = ""
     setupProc.command = [helperPath(), "create-local-calendar", "--provider", provider, "--title", String(displayName || "Calendar")]
+    setupProc.stdinEnabled = true
     setupProc.running = true
+    setupWatchdog.restart()
   }
 
   function setupCalDav(displayName, url, username, password) {
@@ -573,7 +578,9 @@ Item {
       password: String(password || "")
     })
     setupProc.command = [helperPath(), "setup-caldav", "--provider", provider]
+    setupProc.stdinEnabled = true
     setupProc.running = true
+    setupWatchdog.restart()
   }
 
   Process {
@@ -656,6 +663,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: calendarsOut; waitForEnd: true }
@@ -674,6 +682,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: setupOut; waitForEnd: true }
@@ -681,6 +690,20 @@ Item {
 
     onExited: function(exitCode) {
       root.finishSetup(root.helperText(setupOut.text, setupErr.text), exitCode)
+    }
+  }
+
+  Timer {
+    id: setupWatchdog
+    interval: 120000
+    repeat: false
+    onTriggered: {
+      if (!setupProc.running) return
+      setupProc.running = false
+      root.status = "error"
+      root.setupStatus = ""
+      root.errorMessage = "Calendar setup timed out. Check the server URL and that the server is reachable."
+      root.setupFinished(false, root.errorMessage)
     }
   }
 
@@ -702,6 +725,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
     stdout: StdioCollector { waitForEnd: true }
   }

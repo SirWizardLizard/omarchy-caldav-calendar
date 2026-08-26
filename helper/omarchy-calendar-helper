@@ -437,6 +437,7 @@ def caldav_source_key(source, modules: EdsModules) -> tuple[str, str] | None:
 def quiet_omarchy_collection(source, registry, modules: EdsModules) -> None:
     if not is_omarchy_source_uid(source.get_uid()):
         return
+    source = registry.ref_source(source.get_uid()) or source
     if not source.has_extension(modules.EDataServer.SOURCE_EXTENSION_COLLECTION):
         return
     collection = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_COLLECTION)
@@ -748,8 +749,10 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
         auth.set_method("plain/password")
         auth.set_remember_password(True)
 
-        if not registry.commit_source_sync(child, None):
+        committed_child = commit_new_source(registry, child)
+        if committed_child is None:
             raise ValueError("Failed to save a discovered calendar source.")
+        child = committed_child
         if committed is not None:
             committed.append(child)
         cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
@@ -766,6 +769,39 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
     if not calendars:
         raise ValueError("Connected, but no calendars were found on that CalDAV server.")
     return calendars
+
+
+def commit_new_source(registry, source):
+    """Commit a freshly built source and return the registry-backed object.
+
+    Source.new_with_uid() makes a detached "scratch" source that never gains a
+    D-Bus proxy of its own. Re-using it after the commit makes EDS treat later
+    calls as a second create, which fails with "UID is already in use", so
+    every caller must switch to the registry's copy once the commit lands.
+    """
+    if not registry.commit_source_sync(source, None):
+        return None
+    return registry.ref_source(source.get_uid()) or source
+
+
+def discard_committed_source(registry, uid: str) -> None:
+    """Best-effort rollback for a source we just committed.
+
+    The locally built Source object is not the registry-backed one, so calling
+    remove_sync() on it fails with "not removable" -- which both leaves the
+    orphan behind and masks the error that triggered the rollback.
+    """
+    try:
+        source = registry.ref_source(uid)
+        if source is None:
+            return
+        try:
+            source.remove_sync(None)
+        except Exception:
+            source.set_enabled(False)
+            registry.commit_source_sync(source, None)
+    except Exception:
+        pass
 
 
 def eds_setup_caldav(payload: dict) -> dict:
@@ -835,8 +871,10 @@ def eds_setup_caldav(payload: dict) -> dict:
 
     committed = []
     try:
-        if not registry.commit_source_sync(source, None):
+        committed_source = commit_new_source(registry, source)
+        if committed_source is None:
             raise ValueError("Failed to commit EDS CalDAV source.")
+        source = committed_source
         committed.append(source)
 
         credentials = modules.EDataServer.NamedParameters.new()
@@ -851,8 +889,7 @@ def eds_setup_caldav(payload: dict) -> dict:
         quiet_omarchy_collection(source, registry, modules)
     except Exception:
         for created in reversed(committed):
-            if hasattr(created, "remove_sync"):
-                created.remove_sync(None)
+            discard_committed_source(registry, created.get_uid())
         raise
 
     return {
@@ -1218,7 +1255,8 @@ def eds_create_local_calendar(display_name: str) -> dict:
     calendar.set_backend_name("local")
     if hasattr(calendar, "set_selected"):
         calendar.set_selected(True)
-    if not registry.commit_source_sync(source, None):
+    source = commit_new_source(registry, source)
+    if source is None:
         raise ValueError("Failed to create a local calendar.")
     created = source_calendar(source, registry, modules)
     created["readonly"] = False
