@@ -127,6 +127,17 @@ python3 -c 'from importlib.machinery import SourceFileLoader; import sys
 mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
 assert mod.is_omarchy_source_uid("omarchy-calendar-caldav-9fb4ee14-4efd-4564-a7dd-adc2f704d525")
 assert not mod.is_omarchy_source_uid("c3742f32c586dbe48f75eeb097fe4ed289f3bc2b")
+class ForbiddenRegistry:
+    def ref_source(self, uid):
+        raise AssertionError("must not look up " + str(uid))
+    def commit_source_sync(self, source, cancellable):
+        raise AssertionError("must not commit " + str(source))
+class Scratch:
+    def get_uid(self):
+        return "system-calendar"
+assert mod.commit_new_source(ForbiddenRegistry(), Scratch()) is None
+mod.discard_committed_source(ForbiddenRegistry(), "system-calendar")
+mod.discard_committed_source(ForbiddenRegistry(), "")
 class Child:
     def __init__(self, uid, parent):
         self._uid = uid
@@ -192,6 +203,13 @@ next_token, changed, removed, truncated = mod.parse_sync_collection(xml, "https:
 assert next_token.endswith("/2")
 assert changed[0]["uid"] == "abc" and "BEGIN:VCALENDAR" in changed[0]["ics"]
 assert removed == ["gone"]
+coll = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response><d:href>/calendars/A5C7D016-D937-4041-A1FD-436D669B8EE3/</d:href><d:propstat><d:prop><d:getetag>1</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/calendars/meet.ics</d:href><d:propstat><d:prop><c:calendar-data>BEGIN:VCALENDAR</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:sync-token>http://example.com/ns/sync/9</d:sync-token>
+</d:multistatus>"""
+_tok, coll_changed, coll_removed, _tr = mod.parse_sync_collection(coll, "https://caldav.icloud.com/calendars/")
+assert [item["uid"] for item in coll_changed] == ["meet"] and coll_removed == []
 assert truncated is False
 trunc = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/cal/x.ics</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response><d:sync-token>http://example.com/ns/sync/3</d:sync-token></d:multistatus>"""
 _tok, _ch, _rm, truncated = mod.parse_sync_collection(trunc, "https://caldav.example.com/dav/cal/")

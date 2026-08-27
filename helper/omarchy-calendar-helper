@@ -440,6 +440,32 @@ def is_omarchy_source_uid(uid: str) -> bool:
     return str(uid or "").startswith("omarchy-calendar-")
 
 
+def commit_new_source(registry, source):
+    uid = source.get_uid() if source is not None and hasattr(source, "get_uid") else ""
+    if not is_omarchy_source_uid(uid):
+        return None
+    if not registry.commit_source_sync(source, None):
+        return None
+    return registry.ref_source(uid) or source
+
+
+def discard_committed_source(registry, uid: str) -> None:
+    uid = str(uid or "").strip()
+    if not is_omarchy_source_uid(uid):
+        return
+    try:
+        source = registry.ref_source(uid)
+        if source is None:
+            return
+        try:
+            source.remove_sync(None)
+        except Exception:
+            source.set_enabled(False)
+            registry.commit_source_sync(source, None)
+    except Exception:
+        return
+
+
 def is_omarchy_collection_child(source) -> bool:
     uid = source.get_uid() if hasattr(source, "get_uid") else ""
     if is_omarchy_source_uid(uid):
@@ -459,6 +485,7 @@ def caldav_source_key(source, modules: EdsModules) -> tuple[str, str] | None:
 def quiet_omarchy_collection(source, registry, modules: EdsModules) -> None:
     if not is_omarchy_source_uid(source.get_uid()):
         return
+    source = registry.ref_source(source.get_uid()) or source
     if not source.has_extension(modules.EDataServer.SOURCE_EXTENSION_COLLECTION):
         return
     collection = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_COLLECTION)
@@ -774,19 +801,14 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
         auth.set_method("plain/password")
         auth.set_remember_password(True)
 
-        if not registry.commit_source_sync(child, None):
+        child = commit_new_source(registry, child)
+        if child is None:
             raise ValueError("Failed to save a discovered calendar source.")
         if committed is not None:
             committed.append(child)
         cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
         if cred_provider.can_store(child):
             cred_provider.store_sync(child, credentials, True, None)
-        try:
-            client = modules.ECal.Client.connect_sync(child, modules.ECal.ClientSourceType.EVENTS, 15, None)
-            if hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
-                client.refresh_sync(None)
-        except Exception as error:
-            raise ValueError(f"Added {child.get_display_name()}, but the first sync failed: {error}") from error
         calendars.append(source_calendar(child, registry, modules))
 
     if not calendars:
@@ -948,7 +970,8 @@ def eds_add_direct_calendar(modules: EdsModules, registry, href: str, display_na
     auth.set_user(username)
     auth.set_method("plain/password")
     auth.set_remember_password(True)
-    if not registry.commit_source_sync(source, None):
+    source = commit_new_source(registry, source)
+    if source is None:
         raise ValueError("Failed to save a discovered calendar source.")
     committed.append(source)
     credentials = modules.EDataServer.NamedParameters.new()
@@ -976,8 +999,7 @@ def eds_setup_caldav_propfind(display_name: str, url: str, username: str, passwo
             calendars.append(added)
     except Exception:
         for created in reversed(committed):
-            if hasattr(created, "remove_sync"):
-                created.remove_sync(None)
+            discard_committed_source(registry, created.get_uid())
         raise
     merge_cache_calendars(calendars)
     return {
@@ -1057,7 +1079,8 @@ def eds_setup_caldav(payload: dict) -> dict:
 
     committed = []
     try:
-        if not registry.commit_source_sync(source, None):
+        source = commit_new_source(registry, source)
+        if source is None:
             raise ValueError("Failed to commit EDS CalDAV source.")
         committed.append(source)
 
@@ -1073,8 +1096,7 @@ def eds_setup_caldav(payload: dict) -> dict:
         quiet_omarchy_collection(source, registry, modules)
     except Exception:
         for created in reversed(committed):
-            if hasattr(created, "remove_sync"):
-                created.remove_sync(None)
+            discard_committed_source(registry, created.get_uid())
         raise
 
     return {
@@ -1155,6 +1177,11 @@ def href_event_uid(href: str) -> str:
     return unquote(name)
 
 
+def href_is_event_resource(href: str) -> bool:
+    path = urlsplit(str(href or "")).path
+    return bool(path) and not path.endswith("/")
+
+
 def parse_sync_support(xml_bytes: bytes) -> tuple[bool, str]:
     supported, token, _ctag = parse_sync_probe(xml_bytes)
     return supported, token
@@ -1197,6 +1224,8 @@ def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[di
         if not href:
             continue
         absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
+        if not href_is_event_resource(absolute):
+            continue
         status_text = " ".join((node.text or "") for node in response.iter(f"{DAV_NS}status"))
         if "404" in status_text:
             removed.append(href_event_uid(absolute))
@@ -1310,6 +1339,11 @@ def ingest_changed_items(changed: list, calendar: dict, client, modules: EdsModu
                 ics = raw.decode("utf-8", "replace")
             else:
                 sync_log("sync-ics-get-failed", href=str(item.get("href") or "")[:160], status=_status)
+                if _status in (400, 404, 405, 410):
+                    continue
+                if item.get("uid"):
+                    failed_uids.append(str(item["uid"]))
+                continue
         parsed, complete = events_from_ics(ics, calendar, client, modules, window_start, window_end)
         href_uid = str(item.get("uid") or "")
         if complete and parsed:
@@ -2024,7 +2058,7 @@ def eds_update_calendars(items: list) -> dict:
     updated = []
     for item in items or []:
         calendar_id = str((item or {}).get("id") or "").strip()
-        if not calendar_id:
+        if not calendar_id or not is_omarchy_source_uid(calendar_id):
             continue
         source = registry.ref_source(calendar_id)
         if source is None:
@@ -2066,7 +2100,8 @@ def eds_create_local_calendar(display_name: str) -> dict:
     calendar.set_backend_name("local")
     if hasattr(calendar, "set_selected"):
         calendar.set_selected(True)
-    if not registry.commit_source_sync(source, None):
+    source = commit_new_source(registry, source)
+    if source is None:
         raise ValueError("Failed to create a local calendar.")
     created = source_calendar(source, registry, modules)
     created["readonly"] = False
@@ -2081,6 +2116,8 @@ def eds_create_local_calendar(display_name: str) -> dict:
 
 def eds_remove_calendar(calendar_id: str) -> dict:
     calendar_id = str(calendar_id or "").strip()
+    if not is_omarchy_source_uid(calendar_id):
+        raise ValueError("Calendar not found.")
     modules = load_eds_modules()
     registry = modules.EDataServer.SourceRegistry.new_sync(None)
     source = registry.ref_source(calendar_id)

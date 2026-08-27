@@ -32,6 +32,7 @@ Item {
   property var pendingUpdateEvents: []
   property string pendingUpdateScope: ""
   property var pendingDeleteEvents: []
+  property var suppressedDeletes: []
   property int reminderMinutes: 10
   property string reminderTimeFormat: "12h"
   property var firedReminders: ({})
@@ -116,10 +117,42 @@ Item {
     return out.slice(0, 200)
   }
 
+  function eventSuppressed(event) {
+    if (!event) return false
+    for (var i = 0; i < (suppressedDeletes || []).length; i++) {
+      var s = suppressedDeletes[i]
+      if (!s) continue
+      if (s.scope === "all") {
+        if (event.uid === s.uid && event.calendarId === s.calendarId) return true
+      } else if (event.id === s.id || (event.uid === s.uid && event.calendarId === s.calendarId && (event.rid === s.rid || event.start === s.start))) {
+        return true
+      }
+    }
+    return false
+  }
+
   function applyCache(payload, fromLive) {
     var incoming = (payload.calendars || []).slice(0, 200)
     root.cachedCalendars = fromLive ? incoming : root.unionCalendars(root.cachedCalendars, incoming)
-    root.cachedEvents = (payload.events || []).slice(0, 8000)
+    var events = (payload.events || []).slice(0, 8000)
+    if ((suppressedDeletes || []).length) {
+      var raw = events
+      events = events.filter(function(event) { return !root.eventSuppressed(event) })
+      if (fromLive) {
+        var still = []
+        for (var i = 0; i < suppressedDeletes.length; i++) {
+          var s = suppressedDeletes[i]
+          var seen = false
+          for (var j = 0; j < raw.length; j++) {
+            if (s.scope === "all" && raw[j] && raw[j].uid === s.uid && raw[j].calendarId === s.calendarId) seen = true
+            else if (s.scope !== "all" && raw[j] && (raw[j].id === s.id || (raw[j].uid === s.uid && raw[j].calendarId === s.calendarId && (raw[j].rid === s.rid || raw[j].start === s.start)))) seen = true
+          }
+          if (seen) still.push(s)
+        }
+        suppressedDeletes = still
+      }
+    }
+    root.cachedEvents = events
     showActiveRange()
     root.status = "ready"
     root.errorMessage = ""
@@ -433,6 +466,9 @@ Item {
     provider = "evolution-data-server"
     errorMessage = ""
     discardInFlightSnapshot()
+    var suppress = (suppressedDeletes || []).slice()
+    suppress.push({ id: event.id, uid: event.uid, rid: event.rid || "", start: event.start || "", calendarId: event.calendarId, scope: deleteScope })
+    suppressedDeletes = suppress
     var source = cachedEvents.length ? cachedEvents : events
     pendingDeleteEvents = []
     for (var d = 0; d < source.length; d++) {
@@ -757,6 +793,7 @@ Item {
         var payload = Model.parseOperationResponse(root.helperText(deleteOut.text, deleteErr.text))
         for (var i = 0; i < (root.pendingDeleteEvents || []).length; i++) root.mergeEvent(root.pendingDeleteEvents[i])
         root.pendingDeleteEvents = []
+        root.suppressedDeletes = []
         root.errorMessage = root.failMessage(payload, "Could not delete event.")
         root.status = "error"
         return
@@ -796,6 +833,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: calendarsOut; waitForEnd: true }
@@ -814,6 +852,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
 
     stdout: StdioCollector { id: setupOut; waitForEnd: true }
@@ -842,6 +881,7 @@ Item {
     onStarted: {
       write(secret + "\n")
       secret = ""
+      stdinEnabled = false
     }
     stdout: StdioCollector { waitForEnd: true }
   }

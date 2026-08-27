@@ -1997,6 +1997,7 @@ Panel {
 
       SettingsSection {
         title: "Calendars"
+        statusText: calendarService && calendarService.syncing ? "Syncing" : ""
         Repeater {
           model: calendarService ? calendarService.calendars : []
           SettingsCalendarRow {
@@ -2136,6 +2137,7 @@ Panel {
   component SettingsSection: Column {
     id: settingsSection
     property string title: ""
+    property string statusText: ""
     default property alias content: body.children
 
     width: parent ? parent.width : 0
@@ -2145,13 +2147,22 @@ Panel {
       width: parent.width
       spacing: Style.space(4)
 
-      Text {
-        width: parent.width
-        text: settingsSection.title
-        color: Color.accent
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-        font.pixelSize: Style.font.body
-        font.bold: true
+      Row {
+        spacing: Style.space(8)
+        Text {
+          text: settingsSection.title
+          color: Color.accent
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.body
+          font.bold: true
+        }
+        Text {
+          visible: settingsSection.statusText !== ""
+          text: settingsSection.statusText
+          color: Color.muted
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
       }
       Rectangle {
         width: parent.width
