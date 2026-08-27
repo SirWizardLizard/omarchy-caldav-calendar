@@ -809,12 +809,6 @@ def eds_attach_discovered_calendars(modules: EdsModules, registry, parent, crede
         cred_provider = modules.EDataServer.SourceCredentialsProvider.new(registry)
         if cred_provider.can_store(child):
             cred_provider.store_sync(child, credentials, True, None)
-        try:
-            client = modules.ECal.Client.connect_sync(child, modules.ECal.ClientSourceType.EVENTS, 15, None)
-            if hasattr(client, "check_refresh_supported") and client.check_refresh_supported():
-                client.refresh_sync(None)
-        except Exception as error:
-            raise ValueError(f"Added {child.get_display_name()}, but the first sync failed: {error}") from error
         calendars.append(source_calendar(child, registry, modules))
 
     if not calendars:
@@ -1183,6 +1177,11 @@ def href_event_uid(href: str) -> str:
     return unquote(name)
 
 
+def href_is_event_resource(href: str) -> bool:
+    path = urlsplit(str(href or "")).path
+    return bool(path) and not path.endswith("/")
+
+
 def parse_sync_support(xml_bytes: bytes) -> tuple[bool, str]:
     supported, token, _ctag = parse_sync_probe(xml_bytes)
     return supported, token
@@ -1225,6 +1224,8 @@ def parse_sync_collection(xml_bytes: bytes, base_url: str) -> tuple[str, list[di
         if not href:
             continue
         absolute = urljoin(base_url if base_url.endswith("/") else base_url + "/", href)
+        if not href_is_event_resource(absolute):
+            continue
         status_text = " ".join((node.text or "") for node in response.iter(f"{DAV_NS}status"))
         if "404" in status_text:
             removed.append(href_event_uid(absolute))
@@ -1338,6 +1339,11 @@ def ingest_changed_items(changed: list, calendar: dict, client, modules: EdsModu
                 ics = raw.decode("utf-8", "replace")
             else:
                 sync_log("sync-ics-get-failed", href=str(item.get("href") or "")[:160], status=_status)
+                if _status in (400, 404, 405, 410):
+                    continue
+                if item.get("uid"):
+                    failed_uids.append(str(item["uid"]))
+                continue
         parsed, complete = events_from_ics(ics, calendar, client, modules, window_start, window_end)
         href_uid = str(item.get("uid") or "")
         if complete and parsed:
