@@ -649,7 +649,7 @@ function contrastingForeground(color, fillStrength, lightText, darkText) {
 }
 
 function canRemoveCalendar(calendar) {
-  return !!(calendar && calendar.id)
+  return String(calendar && calendar.id || '').indexOf('omarchy-calendar-') === 0
 }
 
 function dateTimeIso(dayKey, timeText) {

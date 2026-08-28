@@ -620,9 +620,6 @@ Item {
   function removeCalendar(calendarId) {
     var id = String(calendarId || "")
     if (!id) return
-    cachedCalendars = cachedCalendars.filter(function(calendar) { return calendar && calendar.id !== id })
-    cachedEvents = cachedEvents.filter(function(event) { return event && event.calendarId !== id })
-    showActiveRange()
     if (removeProc.running) removeProc.running = false
     removeProc.command = [helperPath(), "remove-calendar", "--provider", provider, "--calendar-id", id]
     removeProc.running = true
@@ -821,7 +818,13 @@ Item {
     stdout: StdioCollector { id: removeOut; waitForEnd: true }
     stderr: StdioCollector { id: removeErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) root.readCache()
+      if (exitCode === 0) {
+        root.readCache()
+        return
+      }
+      var payload = Model.parseOperationResponse(root.helperText(removeOut.text, removeErr.text))
+      root.status = "error"
+      root.errorMessage = root.failMessage(payload, "Could not remove calendar.")
     }
   }
 
