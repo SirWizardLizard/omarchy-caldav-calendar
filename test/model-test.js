@@ -44,6 +44,29 @@ assert.equal(selected.previews.length, 2)
 assert.equal(selected.extra, 0)
 assert.equal(selected.previews[0].title, 'Earlier')
 
+const mondayMonthRange = model.monthRange(2026, 7, 1)
+assert.equal(model.localDateKeyFromIso(mondayMonthRange.start), '2026-07-27')
+assert.equal(model.localDateKeyFromIso(mondayMonthRange.end), '2026-09-07')
+assert.equal(grid[0].days[0].key, model.localDateKeyFromIso(mondayMonthRange.start))
+assert.equal(model.nextDateKey(grid[5].days[6].key), model.localDateKeyFromIso(mondayMonthRange.end))
+
+const sundayMonthRange = model.monthRange(2026, 7, 0)
+assert.equal(model.localDateKeyFromIso(sundayMonthRange.start), '2026-07-26')
+assert.equal(model.localDateKeyFromIso(sundayMonthRange.end), '2026-09-06')
+
+const yearBoundaryRange = model.monthRange(2026, 11, 1)
+assert.equal(model.localDateKeyFromIso(yearBoundaryRange.start), '2026-11-30')
+assert.equal(model.localDateKeyFromIso(yearBoundaryRange.end), '2027-01-11')
+
+const overlapEvents = model.eventsInRange([
+  { id: 'overlap', title: 'September overlap', start: '2026-09-01T13:00:00Z', end: '2026-09-01T14:00:00Z' },
+  { id: 'outside', title: 'Outside grid', start: '2026-09-07T13:00:00Z', end: '2026-09-07T14:00:00Z' }
+], mondayMonthRange.start, mondayMonthRange.end)
+assert.deepEqual(overlapEvents.map(event => event.id), ['overlap'])
+const overlapDay = model.monthGrid(2026, 7, 1, '2026-08-20', model.eventsByDay(overlapEvents)).flatMap(week => week.days).find(day => day.key === '2026-09-01')
+assert.equal(overlapDay.eventCount, 1)
+assert.equal(overlapDay.previews[0].title, 'September overlap')
+
 assert.equal(model.eventIsPast({ start: '2026-08-21T09:00:00Z', end: '2026-08-21T10:00:00Z', allDay: false }, new Date('2026-08-21T15:00:00Z')), true)
 assert.equal(model.eventIsPast({ start: '2026-08-21T14:00:00Z', end: '2026-08-21T16:00:00Z', allDay: false }, new Date('2026-08-21T15:00:00Z')), false)
 assert.equal(model.eventIsPast({ start: '2026-08-21', end: '2026-08-22', allDay: true }, new Date('2026-08-21T15:00:00Z')), false)

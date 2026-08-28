@@ -158,7 +158,7 @@ Panel {
 
   function activeRange() {
     return viewMode === "month"
-      ? Model.monthRange(viewYear, viewMonth)
+      ? Model.monthRange(viewYear, viewMonth, weekStart)
       : Model.viewRange(selectedKey, viewMode, weekStart)
   }
 

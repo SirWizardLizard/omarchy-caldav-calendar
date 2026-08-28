@@ -374,9 +374,9 @@ function eventIsPast(event, now) {
   return !!(end && end.getTime() <= current.getTime())
 }
 
-function monthRange(year, month) {
-  var start = new Date(year, month, 1, 0, 0, 0, 0)
-  var end = new Date(year, month + 1, 1, 0, 0, 0, 0)
+function monthRange(year, month, weekStart) {
+  var start = startOfWeek(new Date(year, month, 1), weekStart)
+  var end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 42, 0, 0, 0, 0)
   return { start: start.toISOString(), end: end.toISOString() }
 }
 
@@ -416,9 +416,8 @@ function isoWeek(year, month, day) {
 }
 
 function monthGrid(year, month, weekStart, todayKey, groupedEvents) {
-  var first = new Date(year, month, 1)
-  var offset = (first.getDay() - normalizedWeekStart(weekStart, 1) + 7) % 7
-  var cursor = new Date(year, month, 1 - offset)
+  var range = monthRange(year, month, weekStart)
+  var cursor = new Date(range.start)
   var weeks = []
   for (var row = 0; row < 6; row++) {
     var days = []
