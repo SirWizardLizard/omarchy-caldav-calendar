@@ -181,6 +181,18 @@ def run() -> int:
         probe_status, probe_body = mod.caldav_propfind(work["href"], USER, PASSWORD)
         supported, probed_token, ctag = mod.parse_sync_probe(probe_body) if probe_status in (200, 207) else (False, "", "")
         check("calendar advertises sync-collection", supported is True and probed_token.startswith("http://example.test/ns/sync/"), str((supported, probed_token, ctag)))
+
+        source_webdav_url = mod.source_webdav_url
+        lookup_source_credentials = mod.lookup_source_credentials
+        try:
+            mod.source_webdav_url = lambda _source, _modules: work["href"]
+            mod.lookup_source_credentials = lambda _source, _registry, _modules: (USER, PASSWORD)
+            cache = {"events": [], "syncState": {}}
+            mode, synced, removed = mod.caldav_sync_calendar(object(), object(), object(), {"id": "work", "host": "caldav.fastmail.com"}, None, cache, datetime.now(UTC), datetime.now(UTC) + timedelta(days=30), True)
+            check("initial background poll requests a full EDS fill", mode == "eds" and synced == [] and removed == [] and bool(cache["syncState"]["work"].get("token")), str((mode, cache)))
+        finally:
+            mod.source_webdav_url = source_webdav_url
+            mod.lookup_source_credentials = lookup_source_credentials
     finally:
         proc.terminate()
         try:

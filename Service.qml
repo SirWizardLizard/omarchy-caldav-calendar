@@ -33,6 +33,8 @@ Item {
   property string pendingUpdateScope: ""
   property var pendingDeleteEvents: []
   property var suppressedDeletes: []
+  property string pendingRemoveId: ""
+  property string removeError: ""
   property int reminderMinutes: 10
   property string reminderTimeFormat: "12h"
   property var firedReminders: ({})
@@ -90,7 +92,7 @@ Item {
 
   function pollRemote() {
     if (!activeStart || !activeEnd) return
-    if (snapshotProc.running) return
+    if (snapshotProc.running || mutationBusy()) return
     startLiveSync(true)
   }
 
@@ -133,8 +135,12 @@ Item {
 
   function applyCache(payload, fromLive) {
     var incoming = (payload.calendars || []).slice(0, 200)
-    root.cachedCalendars = fromLive ? incoming : root.unionCalendars(root.cachedCalendars, incoming)
     var events = (payload.events || []).slice(0, 8000)
+    if (!pendingRemoveId) {
+      root.cachedCalendars = fromLive ? incoming : root.unionCalendars(root.cachedCalendars, incoming)
+    } else {
+      events = events.filter(function(event) { return event && event.calendarId !== pendingRemoveId })
+    }
     if ((suppressedDeletes || []).length) {
       var raw = events
       events = events.filter(function(event) { return !root.eventSuppressed(event) })
@@ -180,10 +186,11 @@ Item {
   }
 
   function mutationBusy() {
-    return createProc.running || deleteProc.running || updateProc.running
+    return createProc.running || deleteProc.running || updateProc.running || removeProc.running
   }
 
   function startLiveSync(ifChanged) {
+    if (removeProc.running) return
     if (snapshotProc.running) {
       pendingSnapshot = { start: activeStart, end: activeEnd, provider: provider, ifChanged: ifChanged === true }
       discardInFlightSnapshot()
@@ -619,11 +626,10 @@ Item {
 
   function removeCalendar(calendarId) {
     var id = String(calendarId || "")
-    if (!id) return
-    cachedCalendars = cachedCalendars.filter(function(calendar) { return calendar && calendar.id !== id })
-    cachedEvents = cachedEvents.filter(function(event) { return event && event.calendarId !== id })
-    showActiveRange()
-    if (removeProc.running) removeProc.running = false
+    if (!id || removeProc.running || pendingRemoveId) return
+    pendingRemoveId = id
+    removeError = ""
+    discardInFlightSnapshot()
     removeProc.command = [helperPath(), "remove-calendar", "--provider", provider, "--calendar-id", id]
     removeProc.running = true
   }
@@ -821,7 +827,21 @@ Item {
     stdout: StdioCollector { id: removeOut; waitForEnd: true }
     stderr: StdioCollector { id: removeErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) root.readCache()
+      if (exitCode === 0) {
+        var id = root.pendingRemoveId
+        root.cachedCalendars = root.cachedCalendars.filter(function(calendar) { return calendar && calendar.id !== id })
+        root.cachedEvents = root.cachedEvents.filter(function(event) { return event && event.calendarId !== id })
+        root.showActiveRange()
+        root.pendingRemoveId = ""
+        root.removeError = ""
+        root.readCache()
+        return
+      }
+      var payload = Model.parseOperationResponse(root.helperText(removeOut.text, removeErr.text))
+      root.removeError = root.failMessage(payload, "Could not remove calendar.")
+      root.pendingRemoveId = ""
+      root.status = "error"
+      root.errorMessage = root.removeError
     }
   }
 

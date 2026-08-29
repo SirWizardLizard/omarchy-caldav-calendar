@@ -1997,7 +1997,7 @@ Panel {
 
       SettingsSection {
         title: "Calendars"
-        statusText: calendarService && calendarService.syncing ? "Syncing" : ""
+        statusText: calendarService && calendarService.pendingRemoveId ? "Removing…" : (calendarService && calendarService.removeError ? calendarService.removeError : (calendarService && calendarService.syncing ? "Syncing" : ""))
         Repeater {
           model: calendarService ? calendarService.calendars : []
           SettingsCalendarRow {
@@ -2269,8 +2269,9 @@ Panel {
     Button {
       id: removeCalendarButton
       visible: settingsCalendarRow.removable
+      enabled: !calendarService || !calendarService.pendingRemoveId
       anchors.verticalCenter: parent.verticalCenter
-      text: "Remove"
+      text: calendarService && calendarService.pendingRemoveId === settingsCalendarRow.calendarId ? "Removing" : "Remove"
       bordered: true
       onClicked: {
         if (root.draftDefaultCalendarId === settingsCalendarRow.calendarId) root.draftDefaultCalendarId = ""
