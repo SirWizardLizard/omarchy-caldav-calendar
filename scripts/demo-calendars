@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Seed or restore local demo calendars for screenshots and UI testing."""
+
+import json
+import shutil
+import subprocess
+import sys
+from calendar import monthrange
+from datetime import datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+HELPER = ROOT / "helper/omarchy-calendar-helper"
+PROVIDER = "evolution-data-server"
+DATA = Path.home() / ".local/share/omarchy-calendar"
+BACKUP = DATA / "demo-backup"
+STATE = DATA / "demo-state.json"
+EVO_SOURCES = Path.home() / ".config/evolution/sources"
+EVO_CALENDARS = Path.home() / ".local/share/evolution/calendar"
+
+DEMO = [
+    ("Work", "#89b4fa"),
+    ("Personal", "#a6e3a1"),
+    ("Home", "#cba6f7"),
+]
+
+
+def die(message):
+    raise SystemExit(message)
+
+
+def helper(args, stdin=None, timeout=60):
+    result = subprocess.run(
+        [str(HELPER), *args],
+        input=stdin,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        die(result.stderr.strip() or result.stdout.strip() or f"helper failed: {args[0]}")
+    payload = json.loads(result.stdout)
+    if not payload.get("ok"):
+        die(json.dumps(payload.get("error") or payload, indent=2))
+    return payload
+
+
+def registry():
+    import gi
+
+    gi.require_version("EDataServer", "1.2")
+    from gi.repository import EDataServer
+
+    return EDataServer.SourceRegistry.new_sync(None), EDataServer
+
+
+def caldav_uids(reg, EDataServer):
+    uids = []
+    for source in reg.list_sources(EDataServer.SOURCE_EXTENSION_CALENDAR):
+        uid = source.get_uid()
+        if uid.startswith("omarchy-calendar-caldav-"):
+            uids.append(uid)
+    return uids
+
+
+def set_enabled(reg, uid, enabled):
+    source = reg.ref_source(uid)
+    if source is None:
+        return
+    source.set_enabled(enabled)
+    if not reg.commit_source_sync(source, None):
+        die(f"failed to {'enable' if enabled else 'disable'} {uid}")
+
+
+def remove_source(reg, uid):
+    source = reg.ref_source(uid)
+    if source is None:
+        return
+    try:
+        source.remove_sync(None)
+    except Exception:
+        source.set_enabled(False)
+        reg.commit_source_sync(source, None)
+
+
+def load_state():
+    if not STATE.exists():
+        return None
+    return json.loads(STATE.read_text())
+
+
+def save_state(state):
+    DATA.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def already_demo(reg, EDataServer, state):
+    if state:
+        return True
+    disabled = []
+    for uid in caldav_uids(reg, EDataServer):
+        source = reg.ref_source(uid)
+        if source is not None and not reg.check_enabled(source):
+            disabled.append(uid)
+    names = {source.get_display_name() for source in reg.list_sources(EDataServer.SOURCE_EXTENSION_CALENDAR) if source.get_uid().startswith("omarchy-calendar-local-")}
+    return bool(disabled) and {"Work", "Personal", "Home"} <= names
+
+
+def adopt_legacy_backup():
+    legacy = Path.home() / "Documents/omarchy-calendar-backup-20260829"
+    cache = legacy / "omarchy-calendar" / "cache.json"
+    if not cache.exists():
+        return False
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    if (legacy / "sources").exists():
+        shutil.copytree(legacy / "sources", BACKUP / "sources", dirs_exist_ok=True)
+    if (legacy / "calendar").exists():
+        shutil.copytree(legacy / "calendar", BACKUP / "calendar", dirs_exist_ok=True)
+    for name in ("cache.json", "reminders.json", "sync.log"):
+        src = legacy / "omarchy-calendar" / name
+        if src.exists():
+            shutil.copy2(src, BACKUP / name)
+    return True
+
+
+def backup_real():
+    if (BACKUP / "cache.json").exists():
+        return
+    if adopt_legacy_backup():
+        return
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    if EVO_SOURCES.exists():
+        shutil.copytree(EVO_SOURCES, BACKUP / "sources", dirs_exist_ok=True)
+    if EVO_CALENDARS.exists():
+        shutil.copytree(EVO_CALENDARS, BACKUP / "calendar", dirs_exist_ok=True)
+    if DATA.exists():
+        for name in ("cache.json", "reminders.json", "sync.log"):
+            src = DATA / name
+            if src.exists():
+                shutil.copy2(src, BACKUP / name)
+
+
+def restore_cache():
+    if not (BACKUP / "cache.json").exists():
+        return
+    DATA.mkdir(parents=True, exist_ok=True)
+    for name in ("cache.json", "reminders.json", "sync.log"):
+        src = BACKUP / name
+        if src.exists():
+            shutil.copy2(src, DATA / name)
+
+
+def local_now():
+    return datetime.now().astimezone()
+
+
+def month_grid_start(now):
+    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return first - timedelta(days=first.weekday())
+
+
+def stamp(dt):
+    return dt.astimezone(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+
+
+def day_key(dt):
+    return dt.strftime("%Y%m%d")
+
+
+def vevent(uid, summary, start, end, all_day=False, rrule=""):
+    lines = [
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{stamp(local_now())}",
+        f"SUMMARY:{summary}",
+    ]
+    if all_day:
+        lines.append(f"DTSTART;VALUE=DATE:{day_key(start)}")
+        lines.append(f"DTEND;VALUE=DATE:{day_key(end)}")
+    else:
+        lines.append(f"DTSTART:{stamp(start)}")
+        lines.append(f"DTEND:{stamp(end)}")
+    if rrule:
+        lines.append(f"RRULE:{rrule}")
+    lines.append("END:VEVENT")
+    return "\n".join(lines)
+
+
+def write_ics(calendar_id, events):
+    folder = EVO_CALENDARS / calendar_id
+    folder.mkdir(parents=True, exist_ok=True)
+    body = "\n".join([
+        "BEGIN:VCALENDAR",
+        "CALSCALE:GREGORIAN",
+        "PRODID:-//Omarchy CalDav Calendar//Demo//EN",
+        "VERSION:2.0",
+        f"X-EVOLUTION-DATA-REVISION:{stamp(local_now())}(0)",
+        *events,
+        "END:VCALENDAR",
+        "",
+    ])
+    (folder / "calendar.ics").write_text(body)
+
+
+def ensure_calendars():
+    listed = helper(["list-calendars", "--provider", PROVIDER])
+    by_name = {item.get("name"): item for item in listed.get("calendars") or [] if str(item.get("id") or "").startswith("omarchy-calendar-local-")}
+    ids = {}
+    for name, color in DEMO:
+        existing = by_name.get(name)
+        if existing:
+            ids[name] = existing["id"]
+            helper(
+                ["update-calendars", "--provider", PROVIDER],
+                stdin=json.dumps({"calendars": [{"id": existing["id"], "name": name, "color": color}]}),
+            )
+            continue
+        created = helper(["create-local-calendar", "--provider", PROVIDER, "--title", name])
+        calendar_id = created["calendar"]["id"]
+        helper(
+            ["update-calendars", "--provider", PROVIDER],
+            stdin=json.dumps({"calendars": [{"id": calendar_id, "name": name, "color": color}]}),
+        )
+        ids[name] = calendar_id
+    return ids
+
+
+def seed_events(ids):
+    now = local_now()
+    start = month_grid_start(now)
+    end = start + timedelta(days=42)
+    until = end.astimezone(ZoneInfo("UTC")).strftime("%Y%m%dT235959Z")
+    standup = start.replace(hour=9, minute=0) + timedelta(days=(0 - start.weekday()) % 7)
+    if standup < start:
+        standup += timedelta(days=7)
+    gym = start.replace(hour=18, minute=0) + timedelta(days=(0 - start.weekday()) % 7)
+    market = start.replace(hour=8, minute=0) + timedelta(days=(5 - start.weekday()) % 7)
+    mid = now.replace(day=min(14, monthrange(now.year, now.month)[1]), hour=0, minute=0, second=0, microsecond=0)
+    friday = start + timedelta(days=(4 - start.weekday()) % 7 + 14)
+    work = [
+        vevent(f"demo-standup-{uuid4()}", "Standup", standup, standup + timedelta(minutes=30), rrule=f"FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL={until}"),
+        vevent(f"demo-plan-a-{uuid4()}", "Sprint planning", (start + timedelta(days=9)).replace(hour=14, minute=0), (start + timedelta(days=9)).replace(hour=15, minute=0)),
+        vevent(f"demo-plan-b-{uuid4()}", "Sprint planning", (start + timedelta(days=23)).replace(hour=14, minute=0), (start + timedelta(days=23)).replace(hour=15, minute=0)),
+        vevent(f"demo-demo-{uuid4()}", "Demo", now.replace(hour=11, minute=0, second=0, microsecond=0), now.replace(hour=12, minute=0, second=0, microsecond=0)),
+        vevent(f"demo-offsite-{uuid4()}", "Offsite", (end - timedelta(days=3)).replace(hour=10, minute=0), (end - timedelta(days=3)).replace(hour=16, minute=0)),
+    ]
+    thursday = start + timedelta(days=(3 - start.weekday()) % 7)
+    for week in range(4):
+        day = thursday + timedelta(days=7 * week)
+        work.append(vevent(f"demo-1on1-{week}-{uuid4()}", "1:1", day.replace(hour=15, minute=0), day.replace(hour=15, minute=30)))
+    personal = [
+        vevent(f"demo-gym-{uuid4()}", "Gym", gym, gym + timedelta(hours=1), rrule=f"FREQ=WEEKLY;BYDAY=MO,WE;UNTIL={until}"),
+        vevent(f"demo-bday-{uuid4()}", "Birthday", mid, mid + timedelta(days=1), all_day=True),
+        vevent(f"demo-movie-{uuid4()}", "Movie night", friday.replace(hour=19, minute=30), friday.replace(hour=22, minute=0)),
+        vevent(f"demo-hike-{uuid4()}", "Hike", friday + timedelta(days=1), friday + timedelta(days=3), all_day=True),
+        vevent(f"demo-dentist-{uuid4()}", "Dentist", (end - timedelta(days=4)).replace(hour=8, minute=0), (end - timedelta(days=4)).replace(hour=9, minute=0)),
+        vevent(f"demo-concert-{uuid4()}", "Concert", (start + timedelta(days=5)).replace(hour=20, minute=0), (start + timedelta(days=5)).replace(hour=23, minute=0)),
+    ]
+    payday = now.replace(day=7, hour=0, minute=0, second=0, microsecond=0)
+    home = [
+        vevent(f"demo-rent-{uuid4()}", "Rent", now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), now.replace(day=2, hour=0, minute=0, second=0, microsecond=0), all_day=True),
+        vevent(f"demo-pay-a-{uuid4()}", "Payday", payday, payday + timedelta(days=1), all_day=True),
+        vevent(f"demo-pay-b-{uuid4()}", "Payday", payday + timedelta(days=14), payday + timedelta(days=15), all_day=True),
+        vevent(f"demo-pay-c-{uuid4()}", "Payday", payday + timedelta(days=28), payday + timedelta(days=29), all_day=True),
+        vevent(f"demo-market-{uuid4()}", "Farmers market", market, market + timedelta(hours=2), rrule=f"FREQ=WEEKLY;BYDAY=SA;UNTIL={until}"),
+        vevent(f"demo-bbq-{uuid4()}", "BBQ", now.replace(hour=16, minute=0, second=0, microsecond=0), now.replace(hour=20, minute=0, second=0, microsecond=0)),
+        vevent(f"demo-beach-{uuid4()}", "Beach", end - timedelta(days=1), end, all_day=True),
+        vevent(f"demo-holiday-{uuid4()}", "Holiday", end - timedelta(days=5), end - timedelta(days=4), all_day=True),
+    ]
+    write_ics(ids["Work"], work)
+    write_ics(ids["Personal"], personal)
+    write_ics(ids["Home"], home)
+
+
+def wipe_demo_cache(ids):
+    DATA.mkdir(parents=True, exist_ok=True)
+    calendars = [{"id": ids[name], "name": name, "color": color, "provider": PROVIDER, "host": "", "source": "Evolution Data Server", "readonly": False} for name, color in DEMO]
+    (DATA / "cache.json").write_text(json.dumps({
+        "ok": True,
+        "provider": PROVIDER,
+        "calendars": calendars,
+        "events": [],
+        "syncState": {},
+        "localTouches": {},
+        "rev": 1,
+    }) + "\n")
+
+
+def snapshot_window():
+    now = local_now()
+    start = month_grid_start(now)
+    end = start + timedelta(days=42)
+    helper([
+        "snapshot",
+        "--provider", PROVIDER,
+        "--from", start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--to", end.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    ], timeout=90)
+
+
+def cmd_seed():
+    reg, EDataServer = registry()
+    state = load_state()
+    demo = already_demo(reg, EDataServer, state)
+    backup_real()
+    if not demo:
+        disabled = caldav_uids(reg, EDataServer)
+        for uid in disabled:
+            set_enabled(reg, uid, False)
+    else:
+        disabled = (state or {}).get("disabledCaldav") or [uid for uid in caldav_uids(reg, EDataServer) if not reg.check_enabled(reg.ref_source(uid))]
+        for uid in caldav_uids(reg, EDataServer):
+            source = reg.ref_source(uid)
+            if source is not None and reg.check_enabled(source):
+                set_enabled(reg, uid, False)
+                if uid not in disabled:
+                    disabled.append(uid)
+    ids = ensure_calendars()
+    seed_events(ids)
+    wipe_demo_cache(ids)
+    snapshot_window()
+    save_state({"disabledCaldav": disabled, "demoCalendars": [ids[name] for name, _color in DEMO], "calendars": ids})
+    print("demo calendars ready: Work, Personal, Home")
+    print("omarchy restart shell")
+    print("restore with: python3 scripts/demo-calendars restore")
+
+
+def cmd_restore():
+    state = load_state()
+    if not state:
+        die("no demo state — nothing to restore")
+    reg, _EDataServer = registry()
+    for uid in state.get("demoCalendars") or []:
+        remove_source(reg, uid)
+    for uid in state.get("disabledCaldav") or []:
+        set_enabled(reg, uid, True)
+    restore_cache()
+    STATE.unlink(missing_ok=True)
+    print("real calendars restored")
+    print("omarchy restart shell")
+
+
+def cmd_status():
+    state = load_state()
+    if not state:
+        print("demo: off")
+        return
+    print("demo: on")
+    for name, calendar_id in (state.get("calendars") or {}).items():
+        print(f"  {name}: {calendar_id}")
+    print(f"backup: {BACKUP}")
+
+
+def main(argv):
+    command = (argv[1] if len(argv) > 1 else "").strip()
+    if command == "seed":
+        cmd_seed()
+        return
+    if command == "restore":
+        cmd_restore()
+        return
+    if command == "status":
+        cmd_status()
+        return
+    die("usage: scripts/demo-calendars {seed|restore|status}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -416,8 +416,7 @@ function isoWeek(year, month, day) {
 }
 
 function monthGrid(year, month, weekStart, todayKey, groupedEvents) {
-  var range = monthRange(year, month, weekStart)
-  var cursor = new Date(range.start)
+  var cursor = startOfWeek(new Date(year, month, 1), weekStart)
   var weeks = []
   for (var row = 0; row < 6; row++) {
     var days = []
@@ -437,7 +436,7 @@ function monthGrid(year, month, weekStart, todayKey, groupedEvents) {
         previews: dayEvents.slice(0, 2),
         extra: Math.max(0, dayEvents.length - 2)
       })
-      cursor.setDate(cursor.getDate() + 1)
+      cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1)
     }
     weeks.push({ week: isoWeek(days[3].year, days[3].month, days[3].day), days: days })
   }
@@ -511,7 +510,10 @@ function parseTimeText(value) {
 function parseInstantMs(value) {
   var text = String(value || '')
   if (!text) return NaN
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return Date.parse(text + 'T00:00:00Z')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    var date = dateFromKey(text, null)
+    return date ? date.getTime() : NaN
+  }
   return Date.parse(text)
 }
 
@@ -525,7 +527,7 @@ function eventsInRange(events, startIso, endIso) {
     var eventEnd = parseInstantMs(event.end)
     if (isNaN(eventStart)) return false
     if (isNaN(eventEnd)) eventEnd = eventStart
-    return eventStart < end && eventEnd >= start
+    return eventStart < end && eventEnd > start
   })
 }
 

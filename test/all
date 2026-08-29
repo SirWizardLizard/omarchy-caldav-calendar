@@ -4,7 +4,9 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-node "$ROOT/test/model-test.js"
+for tz in UTC America/Chicago America/New_York Pacific/Honolulu Europe/London Asia/Tokyo Pacific/Auckland Pacific/Kiritimati; do
+  TZ="$tz" node "$ROOT/test/model-test.js"
+done
 bash "$ROOT/test/helper-test.sh"
 bash "$ROOT/test/qml-test.sh"
 python3 "$ROOT/test/caldav-harness.py"
