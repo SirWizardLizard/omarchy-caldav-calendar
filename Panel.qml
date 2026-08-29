@@ -158,7 +158,7 @@ Panel {
 
   function activeRange() {
     return viewMode === "month"
-      ? Model.monthRange(viewYear, viewMonth)
+      ? Model.monthRange(viewYear, viewMonth, weekStart)
       : Model.viewRange(selectedKey, viewMode, weekStart)
   }
 
@@ -2560,6 +2560,7 @@ Panel {
                   width: parent.width
                   height: Style.space(14)
                   mode: "chip"
+                  dimmed: !monthDay.modelData.inMonth
                   event: modelData
                   onClicked: function(mouse) {
                     root.selectedKey = monthDay.modelData.key
@@ -2572,7 +2573,7 @@ Panel {
                 visible: monthDay.modelData.extra > 0
                 width: parent.width
                 text: "+" + monthDay.modelData.extra + " more"
-                color: Color.foreground
+                color: monthDay.modelData.inMonth ? Color.foreground : Util.alpha(Color.foreground, 0.55)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Math.max(9, Style.font.caption - 1)
               }
@@ -2916,6 +2917,7 @@ Panel {
     id: card
     property var event: ({})
     property string mode: "row"
+    property bool dimmed: false
     signal clicked(var mouse)
 
     readonly property color accentColor: root.eventColor(card.event)
@@ -2926,7 +2928,7 @@ Panel {
     readonly property color labelColor: Model.contrastingForeground(card.accentColor, card.fillStrength, Color.foreground, Color.popups.background)
 
     radius: mode === "chip" ? Style.space(3) : Style.cornerRadius
-    opacity: card.saving ? 0.72 : 1
+    opacity: (card.dimmed ? 0.65 : 1) * (card.saving ? 0.72 : 1)
     border.width: card.saving ? 1 : 0
     border.color: Color.accent
     color: Util.alpha(card.accentColor, cardMouse.containsMouse ? Math.min(1, card.fillStrength + 0.1) : card.fillStrength)

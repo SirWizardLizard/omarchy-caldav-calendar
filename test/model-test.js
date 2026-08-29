@@ -1,22 +1,26 @@
 const assert = require('assert')
 const model = require('../CalendarModel.js')
 
+function localIso(key, time) {
+  return model.dateTimeIso(key, time)
+}
+
 const events = model.normalizeEvents([
   {
     uid: '2',
     calendar_uid: 'work',
     calendar: 'Work',
     summary: 'Later',
-    start: '2026-08-20T17:00:00Z',
-    end: '2026-08-20T18:00:00Z'
+    start: localIso('2026-08-20', '17:00'),
+    end: localIso('2026-08-20', '18:00')
   },
   {
     id: '1',
     calendarId: 'personal',
     calendarName: 'Personal',
     title: 'Earlier',
-    start: '2026-08-20T09:00:00Z',
-    end: '2026-08-20T10:00:00Z'
+    start: localIso('2026-08-20', '09:00'),
+    end: localIso('2026-08-20', '10:00')
   }
 ])
 
@@ -44,15 +48,39 @@ assert.equal(selected.previews.length, 2)
 assert.equal(selected.extra, 0)
 assert.equal(selected.previews[0].title, 'Earlier')
 
+const mondayMonthRange = model.monthRange(2026, 7, 1)
+assert.equal(model.localDateKeyFromIso(mondayMonthRange.start), '2026-07-27')
+assert.equal(model.localDateKeyFromIso(mondayMonthRange.end), '2026-09-07')
+assert.equal(grid[0].days[0].key, model.localDateKeyFromIso(mondayMonthRange.start))
+assert.equal(model.nextDateKey(grid[5].days[6].key), model.localDateKeyFromIso(mondayMonthRange.end))
+
+const sundayMonthRange = model.monthRange(2026, 7, 0)
+assert.equal(model.localDateKeyFromIso(sundayMonthRange.start), '2026-07-26')
+assert.equal(model.localDateKeyFromIso(sundayMonthRange.end), '2026-09-06')
+
+const yearBoundaryRange = model.monthRange(2026, 11, 1)
+assert.equal(model.localDateKeyFromIso(yearBoundaryRange.start), '2026-11-30')
+assert.equal(model.localDateKeyFromIso(yearBoundaryRange.end), '2027-01-11')
+
+const overlapEvents = model.eventsInRange([
+  { id: 'overlap', title: 'September overlap', start: '2026-09-01', end: '2026-09-02', allDay: true },
+  { id: 'timed', title: 'Noon overflow', start: localIso('2026-09-01', '12:00'), end: localIso('2026-09-01', '13:00') },
+  { id: 'outside', title: 'Outside grid', start: localIso('2026-09-07', '13:00'), end: localIso('2026-09-07', '14:00') }
+], mondayMonthRange.start, mondayMonthRange.end)
+assert.deepEqual(overlapEvents.map(event => event.id).sort(), ['overlap', 'timed'])
+const overlapDay = model.monthGrid(2026, 7, 1, '2026-08-20', model.eventsByDay(overlapEvents)).flatMap(week => week.days).find(day => day.key === '2026-09-01')
+assert.equal(overlapDay.eventCount, 2)
+assert.equal(overlapDay.previews[0].title, 'September overlap')
+
 assert.equal(model.eventIsPast({ start: '2026-08-21T09:00:00Z', end: '2026-08-21T10:00:00Z', allDay: false }, new Date('2026-08-21T15:00:00Z')), true)
 assert.equal(model.eventIsPast({ start: '2026-08-21T14:00:00Z', end: '2026-08-21T16:00:00Z', allDay: false }, new Date('2026-08-21T15:00:00Z')), false)
-assert.equal(model.eventIsPast({ start: '2026-08-21', end: '2026-08-22', allDay: true }, new Date('2026-08-21T15:00:00Z')), false)
-assert.equal(model.eventIsPast({ start: '2026-08-20', allDay: true }, new Date('2026-08-21T15:00:00Z')), true)
+assert.equal(model.eventIsPast({ start: '2026-08-21', end: '2026-08-22', allDay: true }, new Date(2026, 7, 21, 15, 0)), false)
+assert.equal(model.eventIsPast({ start: '2026-08-20', allDay: true }, new Date(2026, 7, 21, 15, 0)), true)
 
 const overflow = model.monthGrid(2026, 7, 1, '2026-08-20', model.eventsByDay([
-  { id: 'a', title: 'A', start: '2026-08-20T09:00:00Z', end: '2026-08-20T10:00:00Z' },
-  { id: 'b', title: 'B', start: '2026-08-20T10:00:00Z', end: '2026-08-20T11:00:00Z' },
-  { id: 'c', title: 'C', start: '2026-08-20T11:00:00Z', end: '2026-08-20T12:00:00Z' }
+  { id: 'a', title: 'A', start: localIso('2026-08-20', '09:00'), end: localIso('2026-08-20', '10:00') },
+  { id: 'b', title: 'B', start: localIso('2026-08-20', '10:00'), end: localIso('2026-08-20', '11:00') },
+  { id: 'c', title: 'C', start: localIso('2026-08-20', '11:00'), end: localIso('2026-08-20', '12:00') }
 ])).flatMap(week => week.days).find(day => day.key === '2026-08-20')
 assert.equal(overflow.previews.length, 2)
 assert.equal(overflow.extra, 1)
@@ -92,8 +120,10 @@ assert.equal(model.contrastingForeground('#fab387', 0.68, 'light', 'dark'), 'dar
 assert.equal(model.contrastingForeground('#1e1e2e', 0.68, 'light', 'dark'), 'light')
 assert.equal(model.calendarDisplayName({ id: 'a', name: 'Personal' }, { a: 'Home' }), 'Home')
 assert.equal(model.calendarDisplayColor({ id: 'a', color: '#fff' }, { a: '#8aadf4' }, 0), '#8aadf4')
-assert.equal(model.eventsInRange(events, '2026-08-20T00:00:00Z', '2026-08-21T00:00:00Z').length, 2)
-assert.equal(model.eventsInRange(events, '2026-08-21T00:00:00Z', '2026-08-22T00:00:00Z').length, 0)
+const august20 = model.dayRange('2026-08-20')
+const august21 = model.dayRange('2026-08-21')
+assert.equal(model.eventsInRange(events, august20.start, august20.end).length, 2)
+assert.equal(model.eventsInRange(events, august21.start, august21.end).length, 0)
 assert.equal(model.formatClockTime(24, 0), '12 AM next day')
 assert.equal(model.formatClockTime(24, 0, '24h'), '24:00')
 assert.equal(model.formatClockTime(15, 30), '3:30 PM')
@@ -105,7 +135,7 @@ assert(model.dateTimeIso('2026-08-20', '09:05').endsWith('Z'))
 assert.equal(new Date(model.dateTimeIso('2026-08-20', '8am')).getHours(), 8)
 assert.equal(new Date(model.dateTimeIso('2026-08-20', '3pm')).getHours(), 15)
 assert.equal(new Date(model.dateTimeIso('2026-08-20', '8:30 pm')).getMinutes(), 30)
-assert.equal(new Date(model.dateTimeIso('2026-08-20', '24:00')).getUTCDate(), 21)
+assert.equal(model.localDateKeyFromIso(model.dateTimeIso('2026-08-20', '24:00')), '2026-08-21')
 assert.equal(model.dateTimeIso('bad', '09:05'), '')
 assert.equal(model.dateTimeIso('2026-99-99', '09:05'), '')
 assert.equal(model.dateTimeIso('2026-08-20', 'bad'), '')
@@ -189,12 +219,13 @@ assert.equal(model.serializeRecurrence(model.defaultRecurrence('2026-08-20')), '
 assert.equal(model.nextOccurrenceDate('2026-08-21', weekly), '2026-08-25')
 assert.equal(model.nextOccurrenceDate('2026-08-25', weekly), '2026-08-25')
 
+const gymWeek = model.viewRange('2026-08-25', 'week', 1)
 const expanded = model.expandRecurringEvent({
   id: 'series',
   title: 'Gym',
   start: model.dateTimeIso('2026-08-25', '05:00'),
   end: model.dateTimeIso('2026-08-25', '06:00')
-}, 'FREQ=WEEKLY;BYDAY=TU,TH', '2026-08-23T00:00:00Z', '2026-08-30T00:00:00Z')
+}, 'FREQ=WEEKLY;BYDAY=TU,TH', gymWeek.start, gymWeek.end)
 assert.equal(expanded.length, 2)
 assert.equal(new Date(expanded[0].start).getDay(), 2)
 assert.equal(new Date(expanded[1].start).getDay(), 4)
@@ -227,5 +258,56 @@ const pruned = model.pruneFiredKeys({ 'old|2026-08-01T00:00:00Z|10': true, [mode
 assert.equal(pruned['old|2026-08-01T00:00:00Z|10'], undefined)
 assert.equal(pruned[model.reminderKey(meeting, 10)], true)
 assert.equal(model.monthlyOccurrenceOptions('2026-08-28').some(option => option.value === 'byday:-1'), true)
+
+function assertMonthGrid(year, month, weekStart) {
+  const grid = model.monthGrid(year, month, weekStart, '', {})
+  const keys = grid.flatMap(week => week.days.map(day => day.key))
+  assert.equal(keys.length, 42)
+  assert.equal(new Set(keys).size, 42)
+  for (let i = 1; i < keys.length; i++) assert.equal(keys[i], model.nextDateKey(keys[i - 1]))
+  const range = model.monthRange(year, month, weekStart)
+  assert.equal(keys[0], model.localDateKeyFromIso(range.start))
+  assert.equal(model.nextDateKey(keys[41]), model.localDateKeyFromIso(range.end))
+  const inMonth = grid.flatMap(week => week.days).filter(day => day.inMonth)
+  assert.equal(inMonth.length, new Date(year, month + 1, 0).getDate())
+  inMonth.forEach(day => {
+    assert.equal(day.year, year)
+    assert.equal(day.month, month)
+  })
+}
+
+;[0, 1].forEach(weekStart => {
+  [0, 2, 7, 9, 10, 11].forEach(month => assertMonthGrid(2026, month, weekStart))
+})
+
+const mondayIds = model.eventsInRange([
+  { id: 'first', start: '2026-07-27', end: '2026-07-28', allDay: true },
+  { id: 'last', start: '2026-09-06', end: '2026-09-07', allDay: true },
+  { id: 'before', start: '2026-07-26', end: '2026-07-27', allDay: true },
+  { id: 'after', start: '2026-09-07', end: '2026-09-08', allDay: true }
+], mondayMonthRange.start, mondayMonthRange.end).map(event => event.id).sort()
+assert.deepEqual(mondayIds, ['first', 'last'])
+
+const sundayIds = model.eventsInRange([
+  { id: 'first', start: '2026-07-26', end: '2026-07-27', allDay: true },
+  { id: 'last', start: '2026-09-05', end: '2026-09-06', allDay: true },
+  { id: 'before', start: '2026-07-25', end: '2026-07-26', allDay: true },
+  { id: 'after', start: '2026-09-06', end: '2026-09-07', allDay: true }
+], sundayMonthRange.start, sundayMonthRange.end).map(event => event.id).sort()
+assert.deepEqual(sundayIds, ['first', 'last'])
+
+const edgeTimed = model.eventsInRange([
+  { id: 'lateLast', start: localIso('2026-09-06', '23:00'), end: localIso('2026-09-07', '00:30') },
+  { id: 'afterStart', start: localIso('2026-09-07', '01:00'), end: localIso('2026-09-07', '02:00') },
+  { id: 'spillIn', start: localIso('2026-07-26', '23:00'), end: localIso('2026-07-27', '00:30') },
+  { id: 'beforeStart', start: localIso('2026-07-26', '22:00'), end: localIso('2026-07-26', '23:00') }
+], mondayMonthRange.start, mondayMonthRange.end).map(event => event.id).sort()
+assert.deepEqual(edgeTimed, ['lateLast', 'spillIn'])
+
+const spillDay = model.monthGrid(2026, 7, 1, '', model.eventsByDay([
+  { id: 'spillIn', start: localIso('2026-07-26', '23:00'), end: localIso('2026-07-27', '00:30') }
+])).flatMap(week => week.days)
+assert.equal(spillDay.find(day => day.key === '2026-07-27').eventCount, 1)
+assert.equal(spillDay.find(day => day.key === '2026-07-26'), undefined)
 
 console.log('ok - calendar model')

@@ -33,6 +33,15 @@ omarchy plugin validate .
 
 For UI changes, also verify in a running Omarchy session and capture before/after screenshots when preparing a public release.
 
+```bash
+python3 scripts/demo-calendars seed
+omarchy restart shell
+python3 scripts/demo-calendars restore
+omarchy restart shell
+```
+
+`seed` disables CalDAV sources (does not delete them), adds local Work / Personal / Home calendars, and fills the current month grid. Real data is copied to `~/.local/share/omarchy-calendar/demo-backup`. `restore` puts it back.
+
 ## Marketplace updates
 
 `omarchy plugin update` pulls `main`. [omarchyplugins.com](https://omarchyplugins.com) stays on a pinned verified SHA until a **[Verify]** issue is filed.
