@@ -1488,8 +1488,6 @@ def caldav_sync_calendar(source, registry, modules: EdsModules, calendar: dict, 
             sync_log("sync-6578-first", calendarId=calendar_id, ifChanged=if_changed, token=token or probed_token, ctag=ctag)
             if fe:
                 return apply_collection_report(href, username, password, "", calendar, client, source, modules, window_start, window_end, cache, state, calendar_id, ctag, cached_events, if_changed, replace=True)
-            if if_changed:
-                return "unchanged", [], []
             return "eds", [], []
     if fe and (not token or (not cached_events and current.get("filled") is not True)):
         sync_log("sync-6578-recover", calendarId=calendar_id, cached=len(cached_events), token=token)
