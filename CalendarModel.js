@@ -558,6 +558,7 @@ function parseOperationResponse(text) {
       uid: String(parsed.uid || (parsed.event && parsed.event.uid) || ''),
       signedIn: parsed.signedIn === true,
       account: String(parsed.account || ''),
+      status: String(parsed.status || ''),
       error: parsed.error || null
     }
   } catch (error) {

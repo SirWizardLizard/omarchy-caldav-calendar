@@ -24,6 +24,9 @@ if eds_payload="$($ROOT/helper/omarchy-calendar-helper list-calendars --provider
 else
   echo "ok - helper EDS calendar listing skipped"
 fi
+eds_status="$($ROOT/helper/omarchy-calendar-helper eds-status --provider evolution-data-server)"
+jq -e '.status == "present" or .status == "missing"' <<<"$eds_status" >/dev/null
+echo "ok - helper EDS status"
 
 if "$ROOT/helper/omarchy-calendar-helper" snapshot --provider unknown >"$tmp" 2>/dev/null; then
   echo "not ok - unknown provider should fail" >&2

@@ -11,6 +11,7 @@ iCloud, Nextcloud, Fastmail — same two-way sync. Month, week, and day views, m
 ## Install
 
 ```bash
+omarchy pkg add evolution-data-server
 omarchy plugin add https://github.com/SirWizardLizard/omarchy-caldav-calendar --enable
 ```
 
@@ -81,7 +82,7 @@ omarchy plugin remove sirwizardlizard.calendar
 
 ## Requirements
 
-Omarchy 4, Python 3, and Evolution Data Server (already on Omarchy). License: MIT.
+Omarchy 4, Python 3, and Evolution Data Server (`omarchy pkg add evolution-data-server`). License: MIT.
 
 Credentials stay in the system keyring. They are never written to `shell.json` or this repo.
 

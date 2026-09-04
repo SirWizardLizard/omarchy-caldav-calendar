@@ -68,6 +68,10 @@ Panel {
   readonly property string defaultView: validChoice(setting("defaultView", "month"), ["month", "week", "work-week", "day"], "month")
   readonly property bool showWeekNumbers: setting("showWeekNumbers", true) !== false
   readonly property bool showDayPanel: setting("showDayPanel", true) !== false
+  readonly property bool needsEdsInstall: calendarService && calendarService.errorCode === "eds-bindings-missing"
+  readonly property bool edsLoading: calendarService && calendarService.errorCode === "eds-starting"
+  readonly property bool edsStuck: calendarService && calendarService.errorCode === "eds-stuck"
+  readonly property bool compactEds: !showingSettings && (needsEdsInstall || edsLoading || edsStuck)
   readonly property int customWeekStartHour: clampedHour(setting("customWeekStartHour", 8), 8)
   readonly property int customWeekEndHour: clampedEndHour(setting("customWeekEndHour", 18), 18, customWeekStartHour)
   readonly property int customDayStartHour: clampedHour(setting("customDayStartHour", 0), 0)
@@ -100,7 +104,7 @@ Panel {
     }
     root.now = new Date()
     if (calendarService) calendarService.setReminderMinutes(root.reminderMinutes, root.timeFormat)
-    refresh()
+    refresh(!!(calendarService && calendarService.status !== "ready"))
     root.controller.show()
     Qt.callLater(function() { if (root.opened) setCenterHoverRevealSuppressed(true) })
   }
@@ -746,6 +750,20 @@ Panel {
     onTriggered: { if (calendarService) calendarService.pollRemote() }
   }
 
+  Timer {
+    interval: 2000
+    running: root.opened && root.needsEdsInstall
+    repeat: true
+    onTriggered: { if (calendarService) calendarService.probeEds() }
+  }
+
+  Timer {
+    interval: 1000
+    running: root.opened && root.edsLoading
+    repeat: true
+    onTriggered: { if (calendarService) calendarService.retryEdsSnapshot() }
+  }
+
   Connections {
     target: calendarService
     function onEventSaved(ok, message) {
@@ -774,7 +792,7 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(root.showDayPanel ? 1080 : 860))
+    contentWidth: panel.fittedContentWidth(Style.space(root.compactEds ? 640 : (root.showDayPanel ? 1080 : 860)))
     contentHeight: panel.fittedContentHeight(calendarScroll.contentHeight)
 
     PanelKeyCatcher {
@@ -815,12 +833,12 @@ Panel {
 
           Column {
             id: calendarColumn
-            width: Math.min(parent.width, Style.space(root.showDayPanel ? 1060 : 820))
+            width: Math.min(parent.width, Style.space(root.compactEds ? 620 : (root.showDayPanel ? 1060 : 820)))
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(12)
 
             Item {
-              visible: !root.showingSettings
+              visible: !root.showingSettings && !root.compactEds
               width: parent.width
               height: Math.max(viewControls.implicitHeight, titleColumn.implicitHeight, actionControls.implicitHeight, settingsTopButton.implicitHeight)
 
@@ -1343,7 +1361,7 @@ Panel {
             }
 
             Text {
-              visible: !root.showingSettings && calendarService && calendarService.status === "error"
+              visible: !root.showingSettings && calendarService && calendarService.status === "error" && !root.compactEds
               width: parent.width
               text: calendarService ? calendarService.errorMessage : ""
               textFormat: Text.PlainText
@@ -1352,8 +1370,161 @@ Panel {
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
             }
 
+            Text {
+              visible: !root.showingSettings && root.edsLoading
+              width: parent.width
+              text: "Starting Evolution Data Server…"
+              color: Color.muted
+              wrapMode: Text.WordWrap
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            Column {
+              visible: !root.showingSettings && root.edsStuck
+              width: parent.width
+              spacing: Style.space(12)
+              Text {
+                width: parent.width
+                text: calendarService ? calendarService.errorMessage : "Couldn't start Evolution Data Server. Try Sync."
+                color: Color.urgent
+                wrapMode: Text.WordWrap
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.body
+              }
+              Button {
+                text: "Sync"
+                bordered: true
+                onClicked: root.refresh(true)
+              }
+            }
+
+            Item {
+              visible: !root.showingSettings && root.needsEdsInstall
+              width: parent.width
+              height: Math.max(edsMissingText.implicitHeight, edsInstallActions.height)
+
+              Column {
+                id: edsMissingText
+                anchors.left: parent.left
+                anchors.right: edsInstallActions.left
+                anchors.rightMargin: Style.space(16)
+                anchors.top: edsInstallActions.top
+                spacing: Style.space(4)
+                Text {
+                  width: parent.width
+                  text: "Evolution Data Server is not installed."
+                  color: Color.urgent
+                  wrapMode: Text.WordWrap
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+                Text {
+                  width: parent.width
+                  text: "It is required to store calendar data locally."
+                  color: Color.urgent
+                  wrapMode: Text.WordWrap
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              Column {
+                id: edsInstallActions
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+                width: Math.max(edsInstallInner.implicitWidth + Style.space(32), Style.space(280))
+
+                Rectangle {
+                  id: edsInstallButton
+                  width: parent.width
+                  height: edsInstallInner.implicitHeight + Style.space(20)
+                  radius: Style.cornerRadius
+                  border.width: 1
+                  border.color: edsInstallMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.28)
+                  color: edsInstallMouse.pressed ? Style.pressedFillFor(Color.foreground, Color.accent)
+                    : edsInstallMouse.containsMouse ? Style.hoverFillFor(Color.foreground, Color.accent)
+                    : Style.normalFillFor(Color.foreground, Color.accent, Color.urgent)
+
+                  Column {
+                    id: edsInstallInner
+                    anchors.centerIn: parent
+                    spacing: Style.space(6)
+                    Text {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      text: "Click to install"
+                      color: Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+                    Text {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      text: "omarchy pkg add evolution-data-server"
+                      color: Util.alpha(Color.foreground, 0.5)
+                      font.family: "monospace"
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  MouseArea {
+                    id: edsInstallMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      root.close()
+                      if (root.bar) root.bar.run("omarchy-launch-floating-terminal-with-presentation omarchy pkg add evolution-data-server")
+                    }
+                  }
+                }
+
+                Rectangle {
+                  width: parent.width
+                  height: edsSourceInner.implicitHeight + Style.space(12)
+                    radius: Style.cornerRadius
+                    border.width: 1
+                    border.color: edsSourceMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.28)
+                    color: edsSourceMouse.pressed ? Style.pressedFillFor(Color.foreground, Color.accent)
+                      : edsSourceMouse.containsMouse ? Style.hoverFillFor(Color.foreground, Color.accent)
+                      : "transparent"
+
+                    Row {
+                      id: edsSourceInner
+                      anchors.centerIn: parent
+                      spacing: Style.space(8)
+                    Text {
+                      text: "SOURCE"
+                      color: Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                    Text {
+                      text: "↗"
+                      color: Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+                  }
+
+                  MouseArea {
+                    id: edsSourceMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      if (root.bar) root.bar.run("xdg-open 'https://archlinux.org/packages/extra/x86_64/evolution-data-server/'")
+                    }
+                  }
+                }
+              }
+            }
+
             Row {
-              visible: !root.showingSettings
+              visible: !root.showingSettings && !root.compactEds
               width: parent.width
               spacing: Style.space(12)
               Item {

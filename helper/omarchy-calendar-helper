@@ -178,16 +178,36 @@ def load_eds_modules() -> EdsModules:
     try:
         import gi  # type: ignore
     except Exception as error:  # pragma: no cover - depends on host packages
-        raise RuntimeError(f"Python GI bindings are not available: {error}") from error
+        raise RuntimeError("Python GI bindings are not available.") from error
 
-    gi.require_version("EDataServer", "1.2")
-    gi.require_version("ECal", "2.0")
-    gi.require_version("ICalGLib", "4.0")
-    from gi.repository import ECal, EDataServer, GLib, ICalGLib  # type: ignore
+    try:
+        gi.require_version("EDataServer", "1.2")
+        gi.require_version("ECal", "2.0")
+        gi.require_version("ICalGLib", "4.0")
+        from gi.repository import ECal, EDataServer, GLib, ICalGLib  # type: ignore
+    except Exception as error:  # pragma: no cover - depends on host packages
+        raise RuntimeError("Evolution Data Server is not installed.") from error
 
     modules = EdsModules(EDataServer=EDataServer, ECal=ECal, ICalGLib=ICalGLib)
     modules.GLib = GLib
     return modules
+
+
+def eds_status() -> dict:
+    try:
+        load_eds_modules()
+        return {"ok": True, "provider": "evolution-data-server", "status": "present"}
+    except Exception as error:  # pragma: no cover - depends on host packages
+        return {
+            "ok": False,
+            "provider": "evolution-data-server",
+            "status": "missing",
+            "error": {
+                "code": "eds-bindings-missing",
+                "message": "Evolution Data Server is not installed. It is required to store calendar data locally.",
+                "detail": str(error),
+            },
+        }
 
 
 def source_provider(source, registry, modules: EdsModules) -> str:
@@ -1529,7 +1549,7 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
             "events": [],
             "error": {
                 "code": "eds-bindings-missing",
-                "message": "Evolution Data Server bindings are not available.",
+                "message": "Evolution Data Server is not installed. It is required to store calendar data locally.",
                 "detail": str(error),
             },
         }
@@ -2152,7 +2172,7 @@ def remove_cache_event(event_id: str) -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Return normalized calendar data as JSON")
-    parser.add_argument("operation", choices=["snapshot", "list-calendars", "create-event", "update-event", "delete-event", "setup-caldav", "create-local-calendar", "update-calendars", "remove-calendar", "reminders-state", "reminders-save", "ensure-center-anchor"])
+    parser.add_argument("operation", choices=["snapshot", "list-calendars", "create-event", "update-event", "delete-event", "setup-caldav", "create-local-calendar", "update-calendars", "remove-calendar", "reminders-state", "reminders-save", "ensure-center-anchor", "eds-status"])
     parser.add_argument("--provider", default=os.environ.get("OMARCHY_CALENDAR_PROVIDER", "mock"))
     parser.add_argument("--from", dest="start", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)))
     parser.add_argument("--to", dest="end", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=31)))
@@ -2181,6 +2201,8 @@ def main(argv: list[str]) -> int:
             if args.operation == "list-calendars":
                 payload = {key: value for key, value in payload.items() if key != "events"}
             return emit_json(payload)
+        if args.operation == "eds-status":
+            return emit_json(eds_status())
         if args.operation == "ensure-center-anchor":
             return emit_json(ensure_center_anchor(args.title or "sirwizardlizard.calendar"))
         if args.operation == "reminders-state":
