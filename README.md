@@ -11,11 +11,12 @@ iCloud, Nextcloud, Fastmail — same two-way sync. Month, week, and day views, m
 ## Install
 
 ```bash
-omarchy pkg add evolution-data-server
 omarchy plugin add https://github.com/SirWizardLizard/omarchy-caldav-calendar --enable
 ```
 
 This replaces the built-in clock. Shortcuts stay put. If Omarchy leaves the center pin on `omarchy.clock`, the plugin retargets that pin to itself on first run. It does not change a custom or empty pin.
+
+The plugin needs Evolution Data Server. If it is not installed, the clock opens a prompt with **Click to install** (opens a terminal for `omarchy pkg add evolution-data-server`) and **SOURCE** (the Arch package page). You do not have to run that command yourself.
 
 ## What it does
 
@@ -82,7 +83,7 @@ omarchy plugin remove sirwizardlizard.calendar
 
 ## Requirements
 
-Omarchy 4, Python 3, and Evolution Data Server (`omarchy pkg add evolution-data-server`). License: MIT.
+Omarchy 4, Python 3, and Evolution Data Server. If EDS is missing, the plugin offers to install it. License: MIT.
 
 Credentials stay in the system keyring. They are never written to `shell.json` or this repo.
 
