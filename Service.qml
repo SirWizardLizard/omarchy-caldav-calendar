@@ -15,6 +15,7 @@ Item {
   property var eventsByDay: ({})
   property string status: "idle"
   property string errorMessage: ""
+  property string errorCode: ""
   property string activeStart: ""
   property string activeEnd: ""
   property var pendingSnapshot: null
@@ -40,6 +41,7 @@ Item {
   property var firedReminders: ({})
   property var pendingNotices: []
   property bool remindersReady: false
+  property int edsLoadTries: 0
   readonly property int maxHelperBytes: 8 * 1024 * 1024
   readonly property int maxHelperErrorBytes: 64 * 1024
 
@@ -54,6 +56,10 @@ Item {
 
   function failMessage(payload, fallback) {
     return Model.plainDisplay((payload && payload.error && payload.error.message) || fallback || "Calendar helper failed", 400)
+  }
+
+  function failCode(payload) {
+    return String((payload && payload.error && payload.error.code) || "")
   }
 
   function helperText(out, err) {
@@ -79,8 +85,21 @@ Item {
     activeEnd = nextEnd
     provider = nextProvider
     generation += 1
-    errorMessage = ""
-    if (cachedEvents.length > 0) {
+    if (errorCode === "eds-bindings-missing") {
+      ignoreCache = true
+      probeEds()
+      return
+    }
+    if (forceSync === true && (errorCode === "eds-stuck" || errorCode === "eds-starting")) {
+      edsLoadTries = 0
+      beginEdsLoad()
+      return
+    }
+    if (errorCode !== "eds-starting" && errorCode !== "eds-stuck") {
+      errorMessage = ""
+      errorCode = ""
+    }
+    if (cachedEvents.length > 0 && errorCode !== "eds-starting" && errorCode !== "eds-stuck") {
       showActiveRange()
       status = "ready"
     }
@@ -93,7 +112,60 @@ Item {
   function pollRemote() {
     if (!activeStart || !activeEnd) return
     if (snapshotProc.running || mutationBusy()) return
+    if (errorCode === "eds-bindings-missing" || errorCode === "eds-starting" || errorCode === "eds-stuck" || status === "loading") return
     startLiveSync(true)
+  }
+
+  function probeEds() {
+    if (probeProc.running) return
+    probeProc.command = [helperPath(), "eds-status", "--provider", provider]
+    probeProc.running = true
+  }
+
+  function beginEdsLoad() {
+    if (errorCode === "eds-starting" && (snapshotProc.running || status === "loading")) return
+    ignoreCache = true
+    errorCode = "eds-starting"
+    errorMessage = ""
+    status = "loading"
+    setupStatus = ""
+    if (edsLoadTries === 0) edsLoadTries = 1
+    refreshed()
+    if (!activeStart || !activeEnd) return
+    startLiveSync(false)
+  }
+
+  function retryEdsSnapshot() {
+    if (status !== "loading" && errorCode !== "eds-starting") return
+    edsLoadTries += 1
+    if (edsLoadTries > 20) {
+      syncing = false
+      status = "error"
+      errorCode = "eds-stuck"
+      errorMessage = "Couldn't start Evolution Data Server. Try Sync."
+      setupStatus = ""
+      refreshed()
+      return
+    }
+    if (!activeStart || !activeEnd) return
+    if (!snapshotProc.running) startLiveSync(false)
+  }
+
+  function finishEdsStatus(text, exitCode) {
+    var payload = Model.parseOperationResponse(text)
+    var present = String(payload.status || "") === "present" || (exitCode === 0 && payload.ok)
+    if (present) {
+      if (errorCode === "eds-stuck") edsLoadTries = 0
+      beginEdsLoad()
+      return
+    }
+    if (errorCode === "eds-starting" || status === "loading") return
+    ignoreCache = true
+    status = "error"
+    errorCode = "eds-bindings-missing"
+    errorMessage = root.failMessage(payload, "Evolution Data Server is not installed. It is required to store calendar data locally.")
+    setupStatus = ""
+    refreshed()
   }
 
   function showActiveRange() {
@@ -199,7 +271,7 @@ Item {
     }
     liveToken += 1
     snapshotProc.token = liveToken
-    if (cachedEvents.length === 0 && ifChanged !== true) status = "loading"
+    if ((cachedEvents.length === 0 && ifChanged !== true) || errorCode === "eds-starting") status = "loading"
     syncing = true
     snapshotTimeout.restart()
     snapshotProc.command = [helperPath(), "snapshot", "--provider", provider, "--from", activeStart, "--to", activeEnd]
@@ -220,10 +292,23 @@ Item {
     var payload = Model.parseHelperResponse(text)
     if (exitCode === 0 && payload.ok) {
       ignoreCache = false
+      edsLoadTries = 0
+      root.errorCode = ""
       applyCache(payload, true)
+    } else if (root.failCode(payload) === "eds-bindings-missing") {
+      ignoreCache = true
+      edsLoadTries = 0
+      root.status = "error"
+      root.errorMessage = root.failMessage(payload, "Evolution Data Server is not installed. It is required to store calendar data locally.")
+      root.errorCode = "eds-bindings-missing"
+      root.setupStatus = ""
+      root.refreshed()
+    } else if (root.errorCode === "eds-starting" || root.status === "loading") {
+      root.syncing = false
     } else if (cachedEvents.length === 0) {
       root.status = "error"
       root.errorMessage = root.failMessage(payload, "Calendar helper failed")
+      root.errorCode = root.failCode(payload)
       root.setupStatus = ""
       root.refreshed()
     }
@@ -746,6 +831,16 @@ Item {
   }
 
   Process {
+    id: probeProc
+    running: false
+    stdout: StdioCollector { id: probeOut; waitForEnd: true }
+    stderr: StdioCollector { id: probeErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishEdsStatus(root.helperText(probeOut.text, probeErr.text), exitCode)
+    }
+  }
+
+  Process {
     id: cacheProc
     property int token: 0
     running: false
@@ -946,9 +1041,15 @@ Item {
       if (!snapshotProc.running) return
       snapshotProc.running = false
       root.syncing = false
+      if (root.errorCode === "eds-starting" || root.status === "loading") {
+        root.syncing = false
+        root.runPendingSnapshot()
+        return
+      }
       if (root.cachedEvents.length === 0) {
         root.status = "error"
         root.errorMessage = "Calendar sync timed out. Try Sync now again."
+        root.errorCode = ""
       } else {
         root.status = "ready"
       }
