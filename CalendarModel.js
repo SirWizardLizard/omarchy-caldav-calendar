@@ -596,6 +596,7 @@ function providerLabel(provider, host) {
     return label.charAt(0).toUpperCase() + label.slice(1)
   }
   if (provider === 'caldav') return 'CalDAV'
+  if (provider === 'webcal') return 'iCalendar'
   if (provider === 'local') return 'On this computer'
   if (provider === 'gnome-online-accounts') return 'Online account'
   return 'Local'

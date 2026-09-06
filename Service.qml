@@ -371,7 +371,7 @@ Item {
         for (var j = 0; j < added.length; j++) {
           var calendar = added[j]
           if (!calendar || !calendar.id) continue
-          calendar.readonly = false
+          if (calendar.readonly === undefined || calendar.readonly === null) calendar.readonly = false
           if (seen[calendar.id] >= 0) next[seen[calendar.id]] = calendar
           else next.push(calendar)
         }
@@ -826,6 +826,22 @@ Item {
       password: String(password || "")
     })
     setupProc.command = [helperPath(), "setup-caldav", "--provider", provider]
+    setupProc.running = true
+    setupTimeout.restart()
+  }
+
+  function setupWebCal(displayName, url) {
+    if (setupBusy || setupProc.running) return
+    provider = "evolution-data-server"
+    status = "saving"
+    setupStatus = "Adding calendar subscription..."
+    errorMessage = ""
+    setupBusy = true
+    setupProc.secret = JSON.stringify({
+      displayName: String(displayName || "Calendar"),
+      url: String(url || "")
+    })
+    setupProc.command = [helperPath(), "setup-webcal", "--provider", provider]
     setupProc.running = true
     setupTimeout.restart()
   }

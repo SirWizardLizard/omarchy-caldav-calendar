@@ -598,6 +598,15 @@ Panel {
       calendarService.createLocalCalendar(setupName)
       return
     }
+    if (setupKind === "webcal") {
+      if (setupUrl === "") {
+        setupError = "An iCalendar URL is required."
+        return
+      }
+      setupError = ""
+      calendarService.setupWebCal(setupName, setupUrl)
+      return
+    }
     if (setupUrl === "" || setupUser === "" || setupPassword === "") {
       setupError = "URL, username, and password are required."
       return
@@ -2199,16 +2208,20 @@ Panel {
             font.pixelSize: Style.font.bodySmall
             font.bold: true
           }
-          Row {
+          Flow {
+            width: parent.width
             spacing: Style.space(6)
             Button { text: "CalDAV"; bordered: true; selected: root.setupKind === "caldav"; onClicked: root.setupKind = "caldav" }
+            Button { text: "iCalendar"; bordered: true; selected: root.setupKind === "webcal"; onClicked: root.setupKind = "webcal" }
             Button { text: "On this computer"; bordered: true; selected: root.setupKind === "local"; onClicked: root.setupKind = "local" }
           }
           Text {
             width: parent.width
             text: root.setupKind === "local"
               ? "Creates a calendar that stays on this computer."
-              : "iCloud, Nextcloud, Fastmail, and other CalDAV servers."
+              : (root.setupKind === "webcal"
+                ? "Subscribes to a read-only iCalendar feed."
+                : "iCloud, Nextcloud, Fastmail, and other CalDAV servers.")
             color: Color.foreground
             wrapMode: Text.WordWrap
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -2222,10 +2235,10 @@ Panel {
             onAccepted: root.commitSetup()
           }
           TextField {
-            visible: root.setupKind === "caldav"
+            visible: root.setupKind === "caldav" || root.setupKind === "webcal"
             width: parent.width
             text: root.setupUrl
-            placeholderText: "CalDAV URL"
+            placeholderText: root.setupKind === "webcal" ? "iCalendar URL" : "CalDAV URL"
             onTextChanged: root.setupUrl = text
             onAccepted: root.commitSetup()
           }
@@ -2259,7 +2272,7 @@ Panel {
           Row {
             spacing: Style.space(8)
             Button {
-              text: root.setupKind === "local" ? "Create calendar" : "Add CalDAV source"
+              text: root.setupKind === "local" ? "Create calendar" : (root.setupKind === "webcal" ? "Add subscription" : "Add CalDAV source")
               onClicked: root.commitSetup()
             }
             Button { text: "Cancel"; bordered: true; onClicked: root.cancelSetup() }
