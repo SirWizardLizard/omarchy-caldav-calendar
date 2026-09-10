@@ -129,8 +129,18 @@ Panel {
   }
 
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
-      root.bar.centerHoverRevealSuppressed = value
+    if (!root.bar) return
+    // Omarchy >= 4.0.3 exposes the flag read-only on the plugin bar API and
+    // provides a setter instead. Never let this abort close(): a throw here
+    // would leave the panel open and holding keyboard focus.
+    try {
+      if (typeof root.bar.setCenterHoverRevealSuppressed === "function")
+        root.bar.setCenterHoverRevealSuppressed(value)
+      else if ("centerHoverRevealSuppressed" in root.bar)
+        root.bar.centerHoverRevealSuppressed = value
+    } catch (e) {
+      console.warn("sirwizardlizard.calendar: centerHoverRevealSuppressed not writable:", e)
+    }
   }
 
   function persistSettings(values) {

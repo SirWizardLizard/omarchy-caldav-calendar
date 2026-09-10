@@ -38,3 +38,9 @@ if ! grep -q "id: setupTimeout" "$ROOT/Service.qml"; then
   exit 1
 fi
 echo "ok - setup has a timeout"
+
+if ! grep -q 'root.bar.setCenterHoverRevealSuppressed(' "$ROOT/Panel.qml"; then
+  echo "not ok - panel must use the bar API setter for centerHoverRevealSuppressed (read-only on Omarchy 4.0.3+)"
+  exit 1
+fi
+echo "ok - panel uses the bar API setter for the center hover reveal flag"
