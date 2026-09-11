@@ -35,6 +35,7 @@ MAX_REMINDER_BYTES = 256 * 1024
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_ERROR_BYTES = 64 * 1024
 MAX_CALDAV_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_CALDAV_TRANSACTION_BYTES = 64 * 1024 * 1024
 CALDAV_READ_CHUNK = 64 * 1024
 MAX_EVENTS = 8000
 MAX_DAV_HREF_CHARS = 8192
@@ -52,6 +53,11 @@ MAX_FIRED = 2000
 class CaldavResponseTooLarge(ValueError):
     def __init__(self) -> None:
         super().__init__("Calendar server response was too large.")
+
+
+class CaldavTransactionTooLarge(ValueError):
+    def __init__(self) -> None:
+        super().__init__("Calendar synchronization responses were too large.")
 
 
 class CaldavUnsafeRedirect(ValueError):
@@ -515,6 +521,17 @@ def ical_time_iso(value, modules: EdsModules | None = None, client=None) -> tupl
     return ical_value_to_iso(value, tzid, modules, client)
 
 
+def ical_time_rid(value) -> str:
+    try:
+        date = f"{value.get_year():04d}{value.get_month():02d}{value.get_day():02d}"
+        if value.is_date():
+            return date
+        suffix = "Z" if value.is_utc() else ""
+        return f"{date}T{value.get_hour():02d}{value.get_minute():02d}{value.get_second():02d}{suffix}"
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+
 def append_component_events(client, component, calendar: dict, window_start: datetime, window_end: datetime, events: list, modules: EdsModules | None = None, event_limit: int = MAX_EVENTS, deadline: float | None = None) -> bool:
     if deadline is not None and time.monotonic() >= deadline:
         return False
@@ -522,11 +539,16 @@ def append_component_events(client, component, calendar: dict, window_start: dat
     if not base["id"] or not base["start"]:
         return False
     if not hasattr(component, "has_recurrences") or not component.has_recurrences():
+        for index, event in enumerate(events):
+            if event.get("id") == base["id"]:
+                events[index] = base
+                return True
         if len(events) >= event_limit:
             return False
         events.append(base)
         return True
-    if client is None:
+    local_generator = getattr(modules.ECal, "recur_generate_instances_sync", None) if modules is not None else None
+    if client is None and not callable(local_generator):
         return False
     ical = component.get_icalcomponent() if hasattr(component, "get_icalcomponent") else None
     if ical is None:
@@ -534,9 +556,9 @@ def append_component_events(client, component, calendar: dict, window_start: dat
     collected = []
     incomplete = False
 
-    def cb(_icomp, instance_start, instance_end, _user_data, _cancellable=None):
+    def cb(icomp, instance_start, instance_end, _user_data, _cancellable=None):
         nonlocal incomplete
-        if (deadline is not None and time.monotonic() >= deadline) or len(events) + len(collected) >= event_limit:
+        if deadline is not None and time.monotonic() >= deadline:
             incomplete = True
             return False
         start, all_day = ical_time_iso(instance_start, modules, client)
@@ -545,29 +567,62 @@ def append_component_events(client, component, calendar: dict, window_start: dat
             incomplete = True
             return False
         event = dict(base)
+        if modules is not None and icomp is not None:
+            try:
+                instance_ical = icomp.clone() if hasattr(icomp, "clone") else icomp
+                instance_component = modules.ECal.Component.new_from_icalcomponent(instance_ical)
+                parsed_instance = component_event(instance_component, calendar, modules, client)
+                if parsed_instance.get("id") and parsed_instance.get("start"):
+                    event = parsed_instance
+            except Exception:
+                pass
         event["start"] = start
         event["end"] = end or start
         event["allDay"] = bool(event["allDay"] or all_day or end_all_day)
-        event["rid"] = iso_to_rid(start, event["allDay"])
+        event["rid"] = event.get("rid") or ical_time_rid(instance_start) or iso_to_rid(start, event["allDay"])
         event["recurring"] = True
         event["id"] = ":".join(part for part in [event["calendarId"], event["uid"], event["rid"] or start] if part)
+        for index, existing in enumerate(collected):
+            if existing.get("id") == event["id"]:
+                collected[index] = event
+                return True
+        if not any(existing.get("id") == event["id"] for existing in events) and len(events) + len(collected) >= event_limit:
+            incomplete = True
+            return False
         collected.append(event)
         return True
 
     try:
-        client.generate_instances_for_object_sync(
-            ical,
-            int(window_start.timestamp()),
-            int(window_end.timestamp()),
-            None,
-            cb,
-            None,
-        )
+        if callable(local_generator):
+            utc_zone = modules.ICalGLib.Timezone.get_utc_timezone()
+            first = modules.ICalGLib.Time.new_from_timet_with_zone(int(window_start.timestamp()), 0, utc_zone)
+            last = modules.ICalGLib.Time.new_from_timet_with_zone(int(window_end.timestamp()), 0, utc_zone)
+
+            def get_timezone(tzid, *_args):
+                return resolve_ical_timezone(modules, str(tzid or ""), client)
+
+            generated = local_generator(ical, first, last, cb, None, get_timezone, None, utc_zone, None)
+        else:
+            generated = client.generate_instances_for_object_sync(
+                ical,
+                int(window_start.timestamp()),
+                int(window_end.timestamp()),
+                None,
+                cb,
+                None,
+            )
     except Exception:
         return False
-    if incomplete:
+    if generated is False or incomplete:
         return False
-    events.extend(collected)
+    by_id = {str(event.get("id") or ""): index for index, event in enumerate(events) if event.get("id")}
+    for event in collected:
+        event_id = str(event.get("id") or "")
+        if event_id in by_id:
+            events[by_id[event_id]] = event
+        else:
+            by_id[event_id] = len(events)
+            events.append(event)
     return True
 
 
@@ -723,7 +778,7 @@ def eds_range_query(start: datetime, end: datetime) -> str:
 
 
 def ics_escape(value: str) -> str:
-    return str(value or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    return str(value or "").replace("\\", "\\\\").replace("\r\n", "\n").replace("\r", "\n").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
 def ics_datetime(value: datetime, all_day: bool) -> str:
@@ -774,6 +829,8 @@ def rrule_for_repeat(repeat: str) -> str:
 
 def normalize_rrule(value: str) -> str:
     text = str(value or "").strip()
+    if "\r" in text or "\n" in text:
+        return ""
     if text.upper().startswith("RRULE:"):
         text = text[6:].strip()
     mapped = rrule_for_repeat(text)
@@ -868,6 +925,36 @@ def extract_rrule(component) -> str:
     return ""
 
 
+def recurrence_id_time(modules: EdsModules, rid: str, template, client=None):
+    text = str(rid or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        stamp = modules.ICalGLib.Time.new_from_string(text)
+        if stamp is not None and hasattr(stamp, "set_is_date"):
+            stamp.set_is_date(1)
+        return stamp
+    if re.fullmatch(r"\d{8}T\d{6}", text):
+        stamp = modules.ICalGLib.Time.new_from_string(text)
+        if stamp is None:
+            return None
+        tzid = template.get_tzid() if template is not None and hasattr(template, "get_tzid") else ""
+        zone = resolve_ical_timezone(modules, tzid, client)
+        if zone is not None:
+            stamp.set_timezone(zone)
+        return stamp
+    try:
+        instant = datetime.strptime(text, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    utc_zone = modules.ICalGLib.Timezone.get_utc_timezone()
+    stamp = modules.ICalGLib.Time.new_from_timet_with_zone(int(instant.timestamp()), 0, utc_zone)
+    tzid = template.get_tzid() if template is not None and hasattr(template, "get_tzid") else ""
+    zone = resolve_ical_timezone(modules, tzid, client)
+    if zone is not None:
+        stamp = stamp.convert_to_zone(zone)
+        stamp.set_timezone(zone)
+    return stamp
+
+
 def eds_update_event(calendar_id: str, uid: str, rid: str, title: str, start: datetime, end: datetime, all_day: bool, location: str, description: str, scope: str = "", to_calendar_id: str = "") -> dict:
     if not uid:
         raise ValueError("update-event requires --uid.")
@@ -876,7 +963,14 @@ def eds_update_event(calendar_id: str, uid: str, rid: str, title: str, start: da
         raise ValueError(f"Calendar is read-only: {source.get_display_name()}")
 
     instance_edit = scope == "this" and bool(rid)
-    ok, existing = client.get_object_sync(uid, rid if instance_edit else None, None)
+    generated_instance = False
+    try:
+        ok, existing = client.get_object_sync(uid, rid if instance_edit else None, None)
+    except Exception:
+        ok, existing = False, None
+    if instance_edit and (not ok or existing is None):
+        ok, existing = client.get_object_sync(uid, None, None)
+        generated_instance = True
     if not ok or existing is None:
         raise ValueError(f"Event not found: {uid}")
 
@@ -891,6 +985,11 @@ def eds_update_event(calendar_id: str, uid: str, rid: str, title: str, start: da
     mod = modules.ECal.ObjModType.THIS if instance_edit else modules.ECal.ObjModType.ALL
     old_start = existing.get_dtstart()
     old_end = existing.get_dtend()
+    if generated_instance:
+        recurrence_id = recurrence_id_time(modules, rid, old_start, client)
+        if recurrence_id is None or not hasattr(existing, "set_recurrenceid"):
+            raise ValueError(f"Invalid recurrence instance: {rid}")
+        existing.set_recurrenceid(recurrence_id)
     tzid = old_start.get_tzid() if old_start else ""
     zone = resolve_ical_timezone(modules, tzid, client)
     utc_zone = modules.ICalGLib.Timezone.get_utc_timezone()
@@ -1048,7 +1147,7 @@ PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
 
 def normalize_caldav_url(url: str) -> str:
     text = str(url or "").strip()
-    if text and not text.startswith("http://") and not text.startswith("https://"):
+    if text and not re.match(r"^https?://", text, re.I):
         return "https://" + text
     return text
 
@@ -1272,11 +1371,12 @@ def eds_setup_caldav(payload: dict) -> dict:
         raise ValueError("Password is required.")
     if any(character.isspace() for character in url):
         raise ValueError("CalDAV URL cannot contain spaces.")
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
+    url = normalize_caldav_url(url)
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.hostname:
         raise ValueError("CalDAV URL must include http(s) scheme and host.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("CalDAV URL cannot include embedded credentials.")
     if any(character.isspace() for character in parsed.hostname):
         raise ValueError("CalDAV URL host cannot contain spaces.")
     if is_forwardemail_host(caldav_hostname(url)):
@@ -1819,8 +1919,16 @@ def budgeted_caldav_http(budget: list[int], deadline: float, method: str, url: s
     remaining = deadline - time.monotonic()
     if budget[0] >= MAX_CALDAV_REQUESTS or remaining <= 0:
         return 0, b"", None
+    if len(budget) < 2:
+        budget.append(0)
+    if budget[1] >= MAX_CALDAV_TRANSACTION_BYTES:
+        raise CaldavTransactionTooLarge()
     budget[0] += 1
-    return caldav_http(method, url, username, password, body, headers, min(25.0, remaining), raise_too_large=True, redirect_collection=redirect_collection)
+    result = caldav_http(method, url, username, password, body, headers, min(25.0, remaining), raise_too_large=True, redirect_collection=redirect_collection)
+    budget[1] += len(result[1])
+    if budget[1] > MAX_CALDAV_TRANSACTION_BYTES:
+        raise CaldavTransactionTooLarge()
+    return result
 
 
 def fetch_multiget_batch(collection_url: str, items: list[dict], username: str, password: str, budget: list[int], deadline: float) -> tuple[list[dict], list[str], list[dict], bool]:
@@ -2015,7 +2123,7 @@ def apply_collection_report(href: str, username: str, password: str, token: str,
 
     def incomplete(reason: str, **fields) -> tuple[str, list, list]:
         sync_log("sync-6578-incomplete", calendarId=calendar_id, reason=reason, requests=budget[0], **fields)
-        mode = "unchanged" if cached_events else "eds"
+        mode = "eds" if replace or not cached_events else "unchanged"
         return mode, [], []
 
     for page in range(MAX_CALDAV_SYNC_PAGES):
@@ -2033,6 +2141,8 @@ def apply_collection_report(href: str, username: str, password: str, token: str,
                     body,
                     {"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
                 )
+            except CaldavTransactionTooLarge:
+                return incomplete("transaction-too-large", page=page + 1)
             except CaldavResponseTooLarge:
                 if not metadata_only:
                     metadata_only = True
@@ -2067,7 +2177,10 @@ def apply_collection_report(href: str, username: str, password: str, token: str,
         remote_uids.extend(removed)
         remote_uids.extend(str(item.get("uid") or "") for item in changed if item.get("uid"))
 
-        hydrated, vanished, fetch_failures = hydrate_changed_items(href, changed, username, password, budget, deadline)
+        try:
+            hydrated, vanished, fetch_failures = hydrate_changed_items(href, changed, username, password, budget, deadline)
+        except CaldavTransactionTooLarge:
+            return incomplete("transaction-too-large", page=page + 1)
         removed.extend(vanished)
         removed_uids.extend(removed)
         if fetch_failures:
@@ -2135,7 +2248,7 @@ def caldav_sync_calendar(source, registry, modules: EdsModules, calendar: dict, 
     has_legacy_touches = any(record.get("legacy") for record in local_touch_map(cache).get(calendar_id, {}).values())
     if not href or not username or not password:
         sync_log("sync-skip-no-creds", calendarId=calendar_id, ifChanged=if_changed)
-        return (("eds", [], []) if has_legacy_touches or not cached_events else ("unchanged", [], []))
+        return "eds", [], []
     token = str(current.get("token") or "")
     ctag = str(current.get("ctag") or "")
     if cache is not None:
@@ -2246,6 +2359,7 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
     cache = json.loads(json.dumps(original_cache))
     start_rev = cache_rev(cache)
     start_state = json.loads(json.dumps(sync_state_map(cache)))
+    invalidate_out_of_range_sync_state(cache, start, end)
     calendar_modes: dict[str, str] = {}
     remote_touches: dict[str, list] = {}
     sync_log("snapshot-start", ifChanged=if_changed, includeEvents=include_events, rev=start_rev)
@@ -2438,6 +2552,22 @@ def parse_event_instant(value: str) -> datetime | None:
         return None
 
 
+def cache_covers_range(cache: dict | None, start: datetime, end: datetime) -> bool:
+    cached_range = (cache or {}).get("range") if isinstance((cache or {}).get("range"), dict) else {}
+    cached_start = parse_event_instant(cached_range.get("start"))
+    cached_end = parse_event_instant(cached_range.get("end"))
+    return cached_start is not None and cached_end is not None and cached_start <= start and cached_end >= end
+
+
+def invalidate_out_of_range_sync_state(cache: dict, start: datetime, end: datetime) -> bool:
+    if cache_covers_range(cache, start, end):
+        return False
+    for current in sync_state_map(cache).values():
+        if isinstance(current, dict):
+            current["filled"] = False
+    return True
+
+
 def sync_log(message: str, **fields) -> None:
     try:
         path = cache_dir() / "sync.log"
@@ -2560,13 +2690,17 @@ def cache_rev(cache: dict | None) -> int:
 
 def normalized_touch_record(key: str, value) -> dict:
     if isinstance(value, dict):
+        try:
+            revision = int(value.get("rev") or 0)
+        except (TypeError, ValueError):
+            revision = 0
         record = {
             "op": str(value.get("op") or "delete"),
             "uid": str(value.get("uid") or ""),
             "hrefUid": str(value.get("hrefUid") or ""),
             "rid": str(value.get("rid") or ""),
             "scope": "instance" if value.get("scope") == "instance" else "series",
-            "rev": int(value.get("rev") or 0),
+            "rev": revision,
         }
         if value.get("legacy"):
             record["legacy"] = True
@@ -2682,6 +2816,7 @@ def prune_local_touches(touches: dict, removed_by_cal: dict, listed_by_cal: dict
     remaining: dict[str, dict[str, dict]] = {}
     for calendar_id, records in (touches or {}).items():
         removed = {str(uid) for uid in (removed_by_cal.get(calendar_id) or []) if uid}
+        listed = {str(uid) for uid in (listed_by_cal or {}).get(calendar_id) or [] if uid}
         acknowledged = {str(key) for key in (acknowledged_by_cal or {}).get(calendar_id) or [] if key}
         kept = {}
         for key, record in (records or {}).items():
@@ -2689,6 +2824,8 @@ def prune_local_touches(touches: dict, removed_by_cal: dict, listed_by_cal: dict
             aliases = touch_record_aliases(record)
             can_acknowledge = max_ack_rev is None or int(record.get("rev") or 0) <= max_ack_rev
             if can_acknowledge and record.get("legacy") and calendar_id in (clear_legacy_calendars or set()):
+                continue
+            if can_acknowledge and record.get("op") == "delete" and not record.get("legacy") and calendar_id in (clear_legacy_calendars or set()) and aliases.isdisjoint(listed):
                 continue
             if can_acknowledge and str(key) in acknowledged:
                 continue
@@ -2744,6 +2881,12 @@ def reconcile_snapshot_with_cache(payload: dict, disk: dict | None, start_rev: i
     if cache_rev(disk) > start_rev or touches:
         state = next_payload.get("syncState") if isinstance(next_payload.get("syncState"), dict) else {}
         snapshot_events = next_payload.get("events") or []
+        if cache_rev(disk) > start_rev and isinstance((disk or {}).get("calendars"), list):
+            disk_calendars = list(disk.get("calendars") or [])
+            disk_calendar_ids = {str(calendar.get("id") or "") for calendar in disk_calendars if calendar and calendar.get("id")}
+            next_payload["calendars"] = disk_calendars
+            snapshot_events = [event for event in snapshot_events if str((event or {}).get("calendarId") or "") in disk_calendar_ids]
+            state = {calendar_id: value for calendar_id, value in state.items() if calendar_id in disk_calendar_ids}
         acknowledged = {}
         for cal_id, records in touches.items():
             if str(modes.get(cal_id) or "") != "updated":
@@ -2764,7 +2907,7 @@ def reconcile_snapshot_with_cache(payload: dict, disk: dict | None, start_rev: i
                 )
             ]
         full_calendars = {str(cal_id) for cal_id, complete in (next_payload.get("_full") or {}).items() if complete}
-        remaining_touches = prune_local_touches(touches, removed_uids, None, acknowledged, start_rev, full_calendars)
+        remaining_touches = prune_local_touches(touches, removed_uids, remote_uids, acknowledged, start_rev, full_calendars)
         merge_disk = dict(disk or {})
         merge_disk["localTouches"] = remaining_touches
         next_payload["events"] = merge_snapshot_with_local(snapshot_events, merge_disk, modes, remote_uids, state, start_state)
@@ -3087,6 +3230,11 @@ def remove_calendar_from_cache(calendar_id: str) -> None:
     def remove(cache):
         cache["calendars"] = [calendar for calendar in (cache.get("calendars") or []) if calendar.get("id") != calendar_id]
         cache["events"] = [event for event in (cache.get("events") or []) if event.get("calendarId") != calendar_id]
+        if isinstance(cache.get("syncState"), dict):
+            cache["syncState"].pop(calendar_id, None)
+        touches = local_touch_map(cache)
+        touches.pop(calendar_id, None)
+        cache["localTouches"] = touches
     mutate_cache(remove)
 
 

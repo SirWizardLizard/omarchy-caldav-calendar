@@ -56,7 +56,7 @@ fi
 jq -e '.ok == false and .error.code == "operation-failed"' "$tmp" >/dev/null
 echo "ok - helper update-event validates uid"
 
-python3 -c 'from importlib.machinery import SourceFileLoader; import sys; mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module(); assert mod.normalize_rrule("never") == ""; assert mod.normalize_rrule("weekly") == "FREQ=WEEKLY"; assert mod.normalize_rrule("FREQ=WEEKLY;BYDAY=TU,TH") == "FREQ=WEEKLY;BYDAY=TU,TH"; assert mod.normalize_rrule("RRULE:FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1") == "FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1"; print("ok - helper rrule normalize")' "$ROOT/helper/omarchy-calendar-helper"
+python3 -c 'from importlib.machinery import SourceFileLoader; import sys; mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module(); assert mod.normalize_rrule("never") == ""; assert mod.normalize_rrule("weekly") == "FREQ=WEEKLY"; assert mod.normalize_rrule("FREQ=WEEKLY;BYDAY=TU,TH") == "FREQ=WEEKLY;BYDAY=TU,TH"; assert mod.normalize_rrule("RRULE:FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1") == "FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1"; assert mod.normalize_rrule("FREQ=DAILY;COUNT=1\r\nATTENDEE:mailto:other@example.com") == ""; assert mod.ics_escape("first\rsecond") == "first\\nsecond"; print("ok - helper rrule normalize")' "$ROOT/helper/omarchy-calendar-helper"
 
 python3 -c 'from importlib.machinery import SourceFileLoader; import sys; mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
 class C:
@@ -192,11 +192,18 @@ print("ok - helper omarchy calendar uid")' "$ROOT/helper/omarchy-calendar-helper
 python3 -c 'from importlib.machinery import SourceFileLoader; import sys
 mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
 assert mod.normalize_caldav_url("caldav.forwardemail.net") == "https://caldav.forwardemail.net"
+assert mod.normalize_caldav_url("HTTPS://caldav.example.com") == "HTTPS://caldav.example.com"
 fwd = mod.caldav_candidate_urls("https://caldav.forwardemail.net", "user@example.com")
 assert fwd[0] == "https://caldav.forwardemail.net/dav/user@example.com/"
 assert "https://caldav.forwardemail.net/dav/" in fwd
 typed = mod.caldav_candidate_urls("https://caldav.forwardemail.net/dav/", "user@example.com")
 assert typed == ["https://caldav.forwardemail.net/dav/"]
+try:
+    mod.eds_setup_caldav({"url": "https://user:secret@caldav.example.com/", "username": "user", "password": "secret"})
+except ValueError as error:
+    assert "embedded credentials" in str(error)
+else:
+    raise AssertionError("embedded URL credentials should be rejected")
 xml = b"""<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:response>
@@ -232,6 +239,7 @@ else:
 print("ok - helper forwardemail propfind parse")' "$ROOT/helper/omarchy-calendar-helper"
 
 python3 -c 'from importlib.machinery import SourceFileLoader; import sys
+from datetime import UTC, datetime
 mod = SourceFileLoader("omarchy_calendar_helper", sys.argv[1]).load_module()
 probe = b"""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>
 <d:sync-token>http://example.com/ns/sync/1</d:sync-token>
@@ -311,6 +319,8 @@ dropped = mod.apply_sync_delta(
 assert dropped == []
 cache = {"localTouches": {"cal": {"08749FFE": "delete", "A5C7D016": "delete"}}}
 assert set(mod.deleted_touch_keys(cache, "cal")) == {"08749FFE", "A5C7D016"}
+invalid_revision = mod.local_touch_map({"localTouches": {"cal": {"uid": {"op": "create", "uid": "uid", "rev": "invalid"}}}})
+assert invalid_revision["cal"]["uid"]["rev"] == 0
 legacy = mod.local_touch_map(cache)
 assert mod.prune_local_touches(legacy, {}, None)["cal"]
 assert mod.prune_local_touches(legacy, {}, {"cal": set()})["cal"]
@@ -322,6 +332,8 @@ records = list(disk_del["localTouches"]["cal"].values())
 assert len(records) == 1 and mod.touch_record_aliases(records[0]) == {"08749FFE", "A5C7D016"}
 assert mod.prune_local_touches(disk_del["localTouches"], {}, None).get("cal")
 assert mod.prune_local_touches(disk_del["localTouches"], {"cal": ["A5C7D016"]}, None) == {}
+assert mod.prune_local_touches(disk_del["localTouches"], {}, {"cal": ["08749FFE", "A5C7D016"]}, None, None, {"cal"}).get("cal")
+assert mod.prune_local_touches(disk_del["localTouches"], {}, {"cal": []}, None, None, {"cal"}) == {}
 created = {"events": []}
 mod.note_event_touch(created, event, "create", "series")
 created_key = next(iter(created["localTouches"]["cal"]))
@@ -359,6 +371,13 @@ older_disk = {**concurrent_disk, "rev": 2, "localTouches": {"cal": {"series:href
 acknowledged = mod.reconcile_snapshot_with_cache({"events": [remote_event], "syncState": {"cal": {"token": "new"}}}, older_disk, 2, {"cal": "updated"}, {"cal": ["uid", "href"]}, older_disk["syncState"], {})
 assert acknowledged["events"] == [remote_event] and acknowledged["localTouches"] == {}
 assert acknowledged["events"][0]["hrefUid"] == "href"
+removed_disk = {"rev": 3, "calendars": [], "events": [], "syncState": {}}
+stale_calendar = {"id": "cal", "name": "Removed"}
+removed_race = mod.reconcile_snapshot_with_cache({"calendars": [stale_calendar], "events": [remote_event], "syncState": {"cal": {"token": "new"}}}, removed_disk, 2, {"cal": "updated"}, {"cal": ["uid", "href"]}, {}, {})
+assert removed_race["calendars"] == [] and removed_race["events"] == [] and removed_race["syncState"] == {}
+full_deleted_disk = {"rev": 2, "calendars": [stale_calendar], "events": [], "localTouches": disk_del["localTouches"]}
+full_deleted = mod.reconcile_snapshot_with_cache({"calendars": [stale_calendar], "events": [], "syncState": {"cal": {"token": "new"}}, "_full": {"cal": True}}, full_deleted_disk, 2, {"cal": "updated"}, {"cal": []}, {}, {})
+assert full_deleted["events"] == [] and full_deleted["localTouches"] == {}
 folder = __import__("tempfile").mkdtemp()
 __import__("os").environ["OMARCHY_CALENDAR_CACHE"] = folder
 disk_events = [
@@ -403,6 +422,15 @@ assert mod.ctag_decision(state, "cal", "abc", True) == "eds"
 state["cal"] = {"supported": False, "ctag": "abc", "filled": True}
 assert mod.ctag_decision(state, "cal", "abc", True) == "unchanged"
 assert mod.ctag_decision(state, "cal", "xyz", True) == "eds"
+covered = {"range": {"start": "2026-01-01T00:00:00Z", "end": "2027-01-01T00:00:00Z"}}
+assert mod.cache_covers_range(covered, datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC))
+assert not mod.cache_covers_range(covered, datetime(2025, 12, 31, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC))
+assert not mod.cache_covers_range(covered, datetime(2026, 8, 1, tzinfo=UTC), datetime(2027, 1, 2, tzinfo=UTC))
+covered["syncState"] = {"cal": {"supported": True, "token": "token", "filled": True}}
+assert not mod.invalidate_out_of_range_sync_state(covered, datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC))
+assert covered["syncState"]["cal"]["filled"] is True
+assert mod.invalidate_out_of_range_sync_state(covered, datetime(2026, 8, 1, tzinfo=UTC), datetime(2027, 1, 2, tzinfo=UTC))
+assert covered["syncState"]["cal"]["filled"] is False
 print("ok - helper rfc6578 sync-collection parse")' "$ROOT/helper/omarchy-calendar-helper"
 
 python3 -c 'from importlib.machinery import SourceFileLoader; import sys
@@ -421,12 +449,14 @@ class Stamp:
   def set_month(self, value): pass
   def set_day(self, value): pass
 class Existing:
+  def __init__(self): self.recurrence_id = None
   def get_dtstart(self): return Value()
   def get_dtend(self): return Value()
   def set_summary(self, value): pass
   def set_location(self, value): pass
   def set_dtstart(self, value): pass
   def set_dtend(self, value): pass
+  def set_recurrenceid(self, value): self.recurrence_id = value
   def clone(self): return self
 class Client:
   def __init__(self): self.get_rids = []; self.mods = []
@@ -449,6 +479,8 @@ class ECal:
   OperationFlags = OperationFlags
 class Time:
   @staticmethod
+  def new_from_string(value): return Stamp()
+  @staticmethod
   def new_from_timet_with_zone(value, is_date, zone): return Stamp()
 class Timezone:
   @staticmethod
@@ -460,6 +492,17 @@ class Modules:
   ECal = ECal
   ICalGLib = ICalGLib
 modules = Modules()
+class LocalInstanceStamp:
+  def is_date(self): return False
+  def is_utc(self): return False
+  def get_year(self): return 2026
+  def get_month(self): return 8
+  def get_day(self): return 1
+  def get_hour(self): return 10
+  def get_minute(self): return 30
+  def get_second(self): return 0
+assert mod.ical_time_rid(LocalInstanceStamp()) == "20260801T103000"
+assert mod.recurrence_id_time(modules, "20260801T103000", Value()) is not None
 clients = []
 def client_for(calendar_id):
   client = Client(); clients.append(client); return modules, object(), Source(), client
@@ -474,6 +517,54 @@ assert clients[-1].get_rids == ["20260801T100000Z"] and clients[-1].mods == ["th
 assert merged[-1][0]["rid"] == "20260801T100000Z" and merged[-1][1] is False
 mod.eds_update_event("cal", "uid", "20260801T100000Z", "All", start, end, False, "", "", "all", "cal")
 assert clients[-1].get_rids == [None] and clients[-1].mods == ["all"] and merged[-1][1] is True
+class MissingInstanceClient(Client):
+  def get_object_sync(self, uid, rid, cancel):
+    self.get_rids.append(rid)
+    if rid: raise RuntimeError("generated instance is not a detached object")
+    self.existing = Existing(); return True, self.existing
+def fallback_client_for(calendar_id):
+  client = MissingInstanceClient(); clients.append(client); return modules, object(), Source(), client
+mod.eds_client_for_calendar = fallback_client_for
+mod.eds_update_event("cal", "uid", "20260801T100000Z", "One", start, end, False, "", "", "this", "cal")
+assert clients[-1].get_rids == ["20260801T100000Z", None] and clients[-1].mods == ["this"]
+assert clients[-1].existing.recurrence_id is not None
+class Instance:
+  def clone(self): return self
+class InstanceStamp:
+  def __init__(self, value): self.value = value
+  def is_date(self): return False
+  def is_utc(self): return False
+  def get_year(self): return 2026
+  def get_month(self): return 8
+  def get_day(self): return 2
+  def get_hour(self): return 12 if "12:00" in self.value else 13
+  def get_minute(self): return 0
+  def get_second(self): return 0
+class Recurring:
+  def has_recurrences(self): return True
+  def get_icalcomponent(self): return self
+class ExpandClient:
+  def generate_instances_for_object_sync(self, ical, first, last, cancel, callback, data):
+    callback(Instance(), InstanceStamp("2026-08-02T12:00:00Z"), InstanceStamp("2026-08-02T13:00:00Z"), data)
+original_component_event = mod.component_event
+original_time_iso = mod.ical_time_iso
+mod.component_event = lambda component, calendar, loaded=None, client=None: ({"id": "cal:uid:20260802T100000Z", "uid": "uid", "rid": "20260802T100000Z", "calendarId": "cal", "title": "Exception", "start": "2026-08-02T12:00:00Z", "end": "2026-08-02T13:00:00Z", "allDay": False} if isinstance(component, Instance) else {"id": "cal:uid", "uid": "uid", "rid": "", "calendarId": "cal", "title": "Master", "start": "2026-08-01T10:00:00Z", "end": "2026-08-01T11:00:00Z", "allDay": False})
+mod.ical_time_iso = lambda value, loaded=None, client=None: (value.value, False)
+expanded = []
+assert mod.append_component_events(ExpandClient(), Recurring(), {"id": "cal"}, start, end + timedelta(days=3), expanded, modules)
+assert expanded == [{"id": "cal:uid:20260802T100000Z", "uid": "uid", "rid": "20260802T100000Z", "calendarId": "cal", "title": "Exception", "start": "2026-08-02T12:00:00Z", "end": "2026-08-02T13:00:00Z", "allDay": False, "recurring": True}]
+assert mod.append_component_events(None, Instance(), {"id": "cal"}, start, end, expanded, modules)
+assert len(expanded) == 1
+def local_generate(ical, first, last, callback, data, get_timezone, timezone_data, default_timezone, cancel):
+  callback(None, InstanceStamp("2026-08-02T12:00:00Z"), InstanceStamp("2026-08-02T13:00:00Z"), data)
+  return True
+ECal.recur_generate_instances_sync = staticmethod(local_generate)
+local_expanded = []
+assert mod.append_component_events(None, Recurring(), {"id": "cal"}, start, end + timedelta(days=3), local_expanded, modules)
+assert local_expanded[0]["rid"] == "20260802T120000"
+del ECal.recur_generate_instances_sync
+mod.component_event = original_component_event
+mod.ical_time_iso = original_time_iso
 print("ok - helper recurrence update scope")' "$ROOT/helper/omarchy-calendar-helper"
 
 python3 -c 'from importlib.machinery import SourceFileLoader; import sys

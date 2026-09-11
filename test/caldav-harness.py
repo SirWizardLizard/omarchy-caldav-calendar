@@ -380,6 +380,11 @@ def run() -> int:
             cache = {"events": [], "syncState": {}}
             mode, synced, removed = mod.caldav_sync_calendar(object(), object(), object(), {"id": "work", "host": "caldav.fastmail.com"}, None, cache, datetime.now(UTC), datetime.now(UTC) + timedelta(days=30), True)
             check("failed initial baseline requests EDS without committing a token", mode == "eds" and synced == [] and removed == [] and not cache["syncState"], str((mode, cache)))
+            mod.lookup_source_credentials = lambda _source, _registry, _modules: ("", "")
+            cache = {"events": [{"uid": "cached", "calendarId": "work"}], "syncState": {"work": {"supported": True, "token": "old", "filled": True}}}
+            mode, synced, removed = mod.caldav_sync_calendar(object(), object(), object(), {"id": "work", "host": "caldav.fastmail.com"}, None, cache, datetime.now(UTC), datetime.now(UTC) + timedelta(days=30), True)
+            check("missing direct credentials falls back to EDS", mode == "eds" and synced == [] and removed == [], str((mode, cache)))
+            mod.lookup_source_credentials = lambda _source, _registry, _modules: (USER, PASSWORD)
             unsupported_probe = b"""<d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:response><d:propstat><d:prop><cs:getctag>same</cs:getctag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"""
             mod.caldav_http = lambda *_args, **_kwargs: (207, unsupported_probe, {})
             cache = {"events": [{"uid": "legacy", "calendarId": "work"}], "syncState": {"work": {"supported": False, "token": "", "ctag": "same", "filled": True}}, "localTouches": {"work": {"legacy": "delete"}}}

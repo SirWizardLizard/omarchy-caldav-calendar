@@ -112,6 +112,9 @@ def main() -> None:
     if mod.MAX_CALDAV_RESPONSE_BYTES != 32 * 1024 * 1024:
         raise SystemExit("not ok - CalDAV response ceiling should be 32 MiB")
     print("ok - helper caldav 32 MiB ceiling")
+    if mod.MAX_CALDAV_TRANSACTION_BYTES != 64 * 1024 * 1024:
+        raise SystemExit("not ok - CalDAV transaction ceiling should be 64 MiB")
+    print("ok - helper caldav 64 MiB transaction ceiling")
     if mod.CALDAV_SYNC_PAGE_SIZE * mod.MAX_CALDAV_SYNC_PAGES < mod.MAX_EVENTS:
         raise SystemExit("not ok - paging ceiling should cover the event resource ceiling")
     print("ok - helper caldav paging ceiling")
@@ -119,6 +122,28 @@ def main() -> None:
     if mod.MAX_CALDAV_REQUESTS < mod.MAX_EVENTS + 2 * pages:
         raise SystemExit("not ok - request budget should cover REPORT, multiget, and GET fallback")
     print("ok - helper caldav request ceiling")
+
+    original_http = mod.caldav_http
+    original_transaction_limit = mod.MAX_CALDAV_TRANSACTION_BYTES
+    mod.MAX_CALDAV_TRANSACTION_BYTES = LIMIT
+    responses = [b"a" * LIMIT, b"b"]
+    mod.caldav_http = lambda *_args, **_kwargs: (207, responses.pop(0), {})
+    transaction_budget = [0]
+    try:
+        status, payload, _headers = mod.budgeted_caldav_http(transaction_budget, time.monotonic() + 1, "REPORT", "https://caldav.example.com/dav/", "user", "pass")
+        if status != 207 or len(payload) != LIMIT or transaction_budget != [1, LIMIT]:
+            raise SystemExit("not ok - exact-size CalDAV transaction should be accepted")
+        try:
+            mod.budgeted_caldav_http(transaction_budget, time.monotonic() + 1, "REPORT", "https://caldav.example.com/dav/", "user", "pass")
+        except mod.CaldavTransactionTooLarge:
+            pass
+        else:
+            raise SystemExit("not ok - oversized CalDAV transaction should fail")
+    finally:
+        mod.caldav_http = original_http
+        mod.MAX_CALDAV_TRANSACTION_BYTES = original_transaction_limit
+    print("ok - helper caldav transaction byte budget")
+
     mod.MAX_CALDAV_RESPONSE_BYTES = LIMIT
     exact = b"a" * LIMIT
     over = b"b" * (LIMIT + 1)
