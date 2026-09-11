@@ -229,6 +229,15 @@ def run() -> int:
             check("paged initial sync commits all pages", mode == "updated" and {event["uid"] for event in synced} == {"uid-alpha@test", "page-a@test", "page-b@test"} and stats["sync"] == 3, str((mode, synced, stats)))
             check("paged initial sync commits terminal token", state["work"]["token"].endswith("/5"), str(state))
 
+            legacy_cache = {
+                "events": list(synced),
+                "syncState": {"work": dict(state["work"])},
+                "localTouches": {"work": {"uid-alpha@test": "delete"}},
+            }
+            legacy_state = legacy_cache["syncState"]
+            mode, migrated, _remote = mod.apply_collection_report(href, USER, PASSWORD, "", calendar, None, None, object(), window_start, window_end, legacy_cache, legacy_state, "work", "", legacy_cache["events"], True, replace=True)
+            check("authoritative baseline restores events hidden by legacy touches", mode == "updated" and any(event["uid"] == "uid-alpha@test" for event in migrated), str((mode, migrated)))
+
             old_token = state["work"]["token"]
             old_events = list(cache["events"])
             expired_state = {"work": dict(state["work"])}

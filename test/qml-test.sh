@@ -44,3 +44,19 @@ if ! grep -q 'root.bar.setCenterHoverRevealSuppressed(' "$ROOT/Panel.qml"; then
   exit 1
 fi
 echo "ok - panel uses the bar API setter for the center hover reveal flag"
+
+python3 - "$ROOT/Panel.qml" <<'PY'
+import re
+import sys
+
+source = open(sys.argv[1]).read()
+match = re.search(r"Dropdown \{\n\s+id: createCalendarDropdown\n(.*?)\n\s+\}", source, re.S)
+if match is None:
+    raise SystemExit("not ok - create calendar dropdown is missing")
+block = match.group(1)
+if "value: root.createCalendarId" not in block:
+    raise SystemExit("not ok - create calendar dropdown is not bound to form state")
+if "createCalendarDropdown.value = Qt.binding(function() { return root.createCalendarId })" not in block:
+    raise SystemExit("not ok - create calendar dropdown does not restore the binding destroyed by shared Dropdown")
+print("ok - create calendar dropdown restores its controlled value binding")
+PY

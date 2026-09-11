@@ -2007,7 +2007,11 @@ def apply_collection_report(href: str, username: str, password: str, token: str,
     removed_count = 0
     final_token = ""
     parse_client = client
-    drop_touches = deleted_touch_records(cache, calendar_id)
+    drop_touches = [
+        record
+        for record in deleted_touch_records(cache, calendar_id)
+        if not (replace and record.get("legacy"))
+    ]
 
     def incomplete(reason: str, **fields) -> tuple[str, list, list]:
         sync_log("sync-6578-incomplete", calendarId=calendar_id, reason=reason, requests=budget[0], **fields)

@@ -1332,6 +1332,7 @@ Panel {
                       font.bold: true
                     }
                     Dropdown {
+                      id: createCalendarDropdown
                       width: parent.width
                       implicitHeight: Style.spacing.controlHeight
                       rowHeight: Style.spacing.controlHeight
@@ -1340,7 +1341,10 @@ Panel {
                       options: root.writableCalendarOptions()
                       foreground: Color.foreground
                       background: Color.popups.background
-                      onChanged: function(value) { root.createCalendarId = value }
+                      onChanged: function(value) {
+                        root.createCalendarId = value
+                        createCalendarDropdown.value = Qt.binding(function() { return root.createCalendarId })
+                      }
                     }
                   }
                 }
