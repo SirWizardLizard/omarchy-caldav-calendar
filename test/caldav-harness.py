@@ -138,10 +138,11 @@ def run() -> int:
         control(base, {"op": "put", "calendar": "work", "filename": "file-delta", "uid": "uid-delta@test", "summary": "Keep Me"})
         _tok, delta_changed, _rm, _tr = report(mod, work["href"], token4)
         work_events = mod.apply_sync_delta(work_events, [], synthetic_events("work", delta_changed))
+        delta_event = next(event for event in work_events if event["uid"] == "uid-delta@test")
         disk = {
             "events": [event for event in work_events if event["uid"] != "uid-delta@test"],
-            "localTouches": {"work": {"uid-delta@test": "delete", "file-delta": "delete"}},
         }
+        mod.note_event_touch(disk, delta_event, "delete", "series")
         held = {"work": {"token": "new"}}
         start = {"work": {"token": "old"}}
         merged = mod.merge_snapshot_with_local(
@@ -155,9 +156,9 @@ def run() -> int:
         check("local delete is not restored by a stale REPORT", not any(event["uid"] == "uid-delta@test" for event in merged), str(merged))
         check("stale REPORT holds the token", held["work"]["token"] == "old")
         pruned = mod.prune_local_touches(disk["localTouches"], {}, None)
-        check("delete-touch survives until 404", pruned.get("work", {}).get("uid-delta@test") == "delete")
+        check("delete-touch survives until 404", len(pruned.get("work", {})) == 1)
         pruned = mod.prune_local_touches(disk["localTouches"], {"work": ["file-delta"]}, None)
-        check("404 clears the matching delete-touch", "file-delta" not in pruned.get("work", {}) and pruned.get("work", {}).get("uid-delta@test") == "delete")
+        check("404 clears all aliases in the delete-touch", not pruned.get("work"))
 
         control(base, {"op": "truncate", "on": True})
         _tok, _ch, _rm, truncated = report(mod, work["href"], pers_token)
@@ -197,8 +198,10 @@ def run() -> int:
             window_start = datetime.now(UTC) - timedelta(days=400)
             window_end = datetime.now(UTC) + timedelta(days=400)
 
-            def fake_events_from_ics(ics, cal, _client, _modules, _start, _end):
+            def fake_events_from_ics(ics, cal, _client, _modules, _start, _end, event_limit=mod.MAX_EVENTS, deadline=None):
                 values = {}
+                if deadline is not None and time.monotonic() >= deadline:
+                    return [], False
                 if "BEGIN:VEVENT" not in str(ics):
                     return [], False
                 for line in str(ics).splitlines():
@@ -208,8 +211,10 @@ def run() -> int:
                 if not values.get("UID"):
                     return [], False
                 if values.get("SUMMARY") == "Expand":
-                    return [{"id": f"{cal['id']}:{values['UID']}:{index}", "uid": f"{values['UID']}:{index}", "calendarId": cal["id"], "title": "Expand"} for index in range(3)], True
-                return [{"id": f"{cal['id']}:{values['UID']}", "uid": values["UID"], "calendarId": cal["id"], "title": values.get("SUMMARY", "")}], True
+                    expanded = [{"id": f"{cal['id']}:{values['UID']}:{index}", "uid": f"{values['UID']}:{index}", "calendarId": cal["id"], "title": "Expand"} for index in range(3)]
+                    return (expanded, True) if len(expanded) <= event_limit else ([], False)
+                parsed = [{"id": f"{cal['id']}:{values['UID']}", "uid": values["UID"], "calendarId": cal["id"], "title": values.get("SUMMARY", "")}]
+                return (parsed, True) if len(parsed) <= event_limit else ([], False)
 
             mod.events_from_ics = fake_events_from_ics
             cache = {"events": [], "syncState": {}, "_removed": {}}
@@ -226,6 +231,9 @@ def run() -> int:
 
             old_token = state["work"]["token"]
             old_events = list(cache["events"])
+            expired_state = {"work": dict(state["work"])}
+            mode, synced, _remote = mod.apply_collection_report(href, USER, PASSWORD, old_token, calendar, None, None, object(), window_start, window_end, cache, expired_state, "work", "", old_events, True, budget=[0], deadline=time.monotonic() - 1)
+            check("expired transaction preserves cache and token", mode == "unchanged" and synced == [] and expired_state["work"]["token"] == old_token, str((mode, expired_state)))
             control(adaptive_base, {"op": "put", "calendar": "work", "filename": "fail-a", "uid": "fail-a@test"})
             control(adaptive_base, {"op": "put", "calendar": "work", "filename": "fail-b", "uid": "fail-b@test"})
             control(adaptive_base, {"op": "config", "report_fail_after": 1})
@@ -316,6 +324,7 @@ def run() -> int:
             check("repeated partial token aborts transaction", mode == "unchanged" and synced == [] and state["work"]["token"] == token_before)
             check("cross-origin event href is rejected", not mod.safe_event_href(href, "https://attacker.invalid/event.ics"))
             check("encoded traversal event hrefs are rejected", all(not mod.safe_event_href(href, value) for value in (href + "%2e%2e/private.ics", href + "%252e%252e/private.ics", href + "safe%2f..%2fprivate.ics", href + "..\\private.ics")))
+            check("encoded iCloud ReminderKit href is accepted", mod.safe_event_href(href, href + "x-apple-reminderkit%3A%252FREMCDReminder%252F48EA0210.ics"))
             vtodo = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:task@test\r\nSUMMARY:Literal BEGIN:VEVENT text\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
             ignored, failures = mod.ingest_changed_items([{"uid": "task", "href": href + "task.ics", "ics": vtodo}], calendar, None, object(), window_start, window_end, USER, PASSWORD)
             check("valid non-event calendar data advances sync", ignored == [] and failures == [], str((ignored, failures)))
@@ -355,15 +364,22 @@ def run() -> int:
 
         source_webdav_url = mod.source_webdav_url
         lookup_source_credentials = mod.lookup_source_credentials
+        caldav_http = mod.caldav_http
         try:
             mod.source_webdav_url = lambda _source, _modules: work["href"]
             mod.lookup_source_credentials = lambda _source, _registry, _modules: (USER, PASSWORD)
             cache = {"events": [], "syncState": {}}
             mode, synced, removed = mod.caldav_sync_calendar(object(), object(), object(), {"id": "work", "host": "caldav.fastmail.com"}, None, cache, datetime.now(UTC), datetime.now(UTC) + timedelta(days=30), True)
-            check("initial background poll requests a full EDS fill", mode == "eds" and synced == [] and removed == [] and bool(cache["syncState"]["work"].get("token")), str((mode, cache)))
+            check("failed initial baseline requests EDS without committing a token", mode == "eds" and synced == [] and removed == [] and not cache["syncState"], str((mode, cache)))
+            unsupported_probe = b"""<d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:response><d:propstat><d:prop><cs:getctag>same</cs:getctag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"""
+            mod.caldav_http = lambda *_args, **_kwargs: (207, unsupported_probe, {})
+            cache = {"events": [{"uid": "legacy", "calendarId": "work"}], "syncState": {"work": {"supported": False, "token": "", "ctag": "same", "filled": True}}, "localTouches": {"work": {"legacy": "delete"}}}
+            mode, synced, removed = mod.caldav_sync_calendar(object(), object(), object(), {"id": "work", "host": "caldav.fastmail.com"}, None, cache, datetime.now(UTC), datetime.now(UTC) + timedelta(days=30), True)
+            check("unsupported legacy touch forces authoritative EDS pull", mode == "eds" and synced == [] and removed == [] and cache.get("_pendingSyncState", {}).get("work", {}).get("ctag") == "same", str((mode, cache)))
         finally:
             mod.source_webdav_url = source_webdav_url
             mod.lookup_source_credentials = lookup_source_credentials
+            mod.caldav_http = caldav_http
     finally:
         proc.terminate()
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import email.message
+import signal
 import sys
 import time
 import urllib.error
@@ -195,6 +196,71 @@ def main() -> None:
     if time.monotonic() - started >= 0.15:
         raise SystemExit("not ok - process-level HTTP deadline fired too late")
     print("ok - helper caldav hard deadline")
+
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 10)
+        try:
+            try:
+                with mod.enforce_http_deadline(1):
+                    pass
+            except TimeoutError:
+                pass
+            else:
+                raise SystemExit("not ok - nested process deadline should be rejected")
+            remaining, _interval = signal.getitimer(signal.ITIMER_REAL)
+            if remaining <= 0:
+                raise SystemExit("not ok - existing process deadline should be preserved")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        print("ok - helper caldav nested deadline preservation")
+
+    handler = mod.CaldavRedirectHandler(lambda _source, target: target.startswith("https://caldav.example.com/dav/"))
+    report_request = urllib.request.Request("https://caldav.example.com/dav/cal", data=b"<xml/>", headers={"Content-Type": "application/xml"}, method="REPORT")
+    redirected = handler.redirect_request(report_request, None, 307, "Temporary Redirect", Headers(), "https://caldav.example.com/dav/cal/")
+    if redirected.get_method() != "REPORT" or redirected.data != b"<xml/>":
+        raise SystemExit("not ok - allowed REPORT redirect should preserve method and body")
+    propfind_request = urllib.request.Request("https://caldav.example.com/dav", data=b"<propfind/>", method="PROPFIND")
+    redirected = handler.redirect_request(propfind_request, None, 301, "Moved", Headers(), "/dav/")
+    if redirected.get_method() != "PROPFIND" or redirected.data != b"<propfind/>":
+        raise SystemExit("not ok - allowed PROPFIND redirect should preserve method and body")
+    try:
+        handler.redirect_request(report_request, None, 307, "Temporary Redirect", Headers(), "https://attacker.invalid/dav/")
+    except mod.CaldavUnsafeRedirect:
+        pass
+    else:
+        raise SystemExit("not ok - cross-origin redirect should be rejected")
+    class PasswordManager:
+        def __init__(self):
+            self.targets = []
+
+        def add_password(self, _realm, target, _username, _password):
+            self.targets.append(target)
+
+    password_manager = PasswordManager()
+    auth_handler = mod.CaldavRedirectHandler(lambda _source, target: target.startswith("https://caldav.example.com/dav/"), password_manager, "user", "pass")
+    auth_handler.redirect_request(report_request, None, 307, "Temporary Redirect", Headers(), "https://caldav.example.com/dav/sibling/")
+    if password_manager.targets != ["https://caldav.example.com/dav/sibling/"]:
+        raise SystemExit("not ok - approved redirect should register scoped credentials")
+    print("ok - helper caldav redirect policy")
+
+    class SlowEmptyClient:
+        def get_object_list_as_comps_sync(self, _query, _cancel):
+            clock[0] = 2.0
+            return True, []
+
+    clock = [0.0]
+    original_monotonic = mod.time.monotonic
+    original_query = mod.eds_range_query
+    mod.time.monotonic = lambda: clock[0]
+    mod.eds_range_query = lambda _start, _end: "query"
+    try:
+        complete = mod.eds_pull_calendar_events(SlowEmptyClient(), {}, None, None, object(), [], deadline=1.0)
+    finally:
+        mod.time.monotonic = original_monotonic
+        mod.eds_range_query = original_query
+    if complete:
+        raise SystemExit("not ok - EDS pull should fail when its blocking call exceeds the deadline")
+    print("ok - helper EDS pull deadline")
 
     original = patch_opener(mod, FakeResponse(exact, {"Content-Length": str(LIMIT)}))
     try:
