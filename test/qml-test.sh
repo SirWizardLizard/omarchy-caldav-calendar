@@ -60,3 +60,9 @@ if "createCalendarDropdown.value = Qt.binding(function() { return root.createCal
     raise SystemExit("not ok - create calendar dropdown does not restore the binding destroyed by shared Dropdown")
 print("ok - create calendar dropdown restores its controlled value binding")
 PY
+
+if ! grep -q 'payload.events && payload.events.length ? payload.events' "$ROOT/Service.qml"; then
+  echo "not ok - recurring create response does not replace optimistic events with expanded occurrences" >&2
+  exit 1
+fi
+echo "ok - recurring creates use expanded helper occurrences"

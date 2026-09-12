@@ -555,6 +555,7 @@ function parseOperationResponse(text) {
       calendar: parsed.calendar || null,
       calendars: Array.isArray(parsed.calendars) ? parsed.calendars : (parsed.calendar ? [parsed.calendar] : []),
       event: parsed.event ? normalizedEvent(parsed.event) : null,
+      events: normalizeEvents(parsed.events),
       uid: String(parsed.uid || (parsed.event && parsed.event.uid) || ''),
       signedIn: parsed.signedIn === true,
       account: String(parsed.account || ''),
@@ -562,7 +563,7 @@ function parseOperationResponse(text) {
       error: parsed.error || null
     }
   } catch (error) {
-    return { ok: false, provider: '', calendar: null, event: null, uid: '', error: { code: 'invalid-json', message: String(error) } }
+    return { ok: false, provider: '', calendar: null, event: null, events: [], uid: '', error: { code: 'invalid-json', message: String(error) } }
   }
 }
 

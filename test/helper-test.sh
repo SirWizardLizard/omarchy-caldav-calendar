@@ -378,6 +378,17 @@ assert removed_race["calendars"] == [] and removed_race["events"] == [] and remo
 full_deleted_disk = {"rev": 2, "calendars": [stale_calendar], "events": [], "localTouches": disk_del["localTouches"]}
 full_deleted = mod.reconcile_snapshot_with_cache({"calendars": [stale_calendar], "events": [], "syncState": {"cal": {"token": "new"}}, "_full": {"cal": True}}, full_deleted_disk, 2, {"cal": "updated"}, {"cal": []}, {}, {})
 assert full_deleted["events"] == [] and full_deleted["localTouches"] == {}
+created_folder = __import__("tempfile").mkdtemp()
+__import__("os").environ["OMARCHY_CALENDAR_CACHE"] = created_folder
+created_master = {"id": "cal:created", "uid": "created", "calendarId": "cal", "rid": "", "title": "Created series"}
+created_occurrences = [{**created_master, "id": "cal:created:1", "rid": "1"}, {**created_master, "id": "cal:created:2", "rid": "2"}]
+mod.write_cache({"ok": True, "calendars": [{"id": "cal"}], "events": [], "syncState": {"cal": {"token": "old"}}, "rev": 2})
+mod.merge_cache_created_series(created_occurrences, created_master)
+created_cache = mod.read_cache()
+assert [item["rid"] for item in created_cache["events"]] == ["1", "2"]
+created_touches = list(created_cache["localTouches"]["cal"].values())
+assert len(created_touches) == 1 and created_touches[0]["scope"] == "series" and created_touches[0]["op"] == "create"
+assert [item["rid"] for item in mod.merge_snapshot_with_local([], created_cache, {"cal": "unchanged"}, {}, created_cache["syncState"], created_cache["syncState"])] == ["1", "2"]
 folder = __import__("tempfile").mkdtemp()
 __import__("os").environ["OMARCHY_CALENDAR_CACHE"] = folder
 disk_events = [
@@ -562,6 +573,9 @@ ECal.recur_generate_instances_sync = staticmethod(local_generate)
 local_expanded = []
 assert mod.append_component_events(None, Recurring(), {"id": "cal"}, start, end + timedelta(days=3), local_expanded, modules)
 assert local_expanded[0]["rid"] == "20260802T120000"
+mod.read_cache = lambda: {"range": {"start": "2026-08-01T00:00:00Z", "end": "2026-08-05T00:00:00Z"}}
+created_expanded = mod.created_event_instances(modules, None, Recurring(), {"id": "cal"}, {"id": "cal:uid", "uid": "uid", "calendarId": "cal"}, start, end, "FREQ=DAILY")
+assert len(created_expanded) == 1 and created_expanded[0]["rid"] == "20260802T120000"
 del ECal.recur_generate_instances_sync
 mod.component_event = original_component_event
 mod.ical_time_iso = original_time_iso

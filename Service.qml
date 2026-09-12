@@ -319,7 +319,8 @@ Item {
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
       root.removePendingCreates(root.pendingCreateId)
-      if (payload.event) root.mergeEvent(payload.event)
+      var created = payload.events && payload.events.length ? payload.events : (payload.event ? [payload.event] : [])
+      root.mergeEvents(created)
       root.status = "ready"
       root.errorMessage = ""
       root.eventCreated(payload.event)
@@ -480,19 +481,32 @@ Item {
   }
 
   function mergeEvent(event) {
-    if (!event || !event.id) return
+    mergeEvents(event ? [event] : [])
+  }
+
+  function mergeEvents(items) {
+    var replacements = {}
+    var order = []
+    for (var itemIndex = 0; itemIndex < (items || []).length; itemIndex++) {
+      var item = items[itemIndex]
+      if (!item || !item.id) continue
+      var key = "$" + item.id
+      if (!replacements[key]) order.push(key)
+      replacements[key] = item
+    }
+    if (!order.length) return
     var next = []
-    var replaced = false
     var source = cachedEvents.length ? cachedEvents : events
     for (var i = 0; i < source.length; i++) {
-      if (source[i] && source[i].id === event.id) {
-        next.push(event)
-        replaced = true
+      var sourceKey = source[i] && source[i].id ? "$" + source[i].id : ""
+      if (sourceKey && replacements[sourceKey]) {
+        next.push(replacements[sourceKey])
+        delete replacements[sourceKey]
       } else {
         next.push(source[i])
       }
     }
-    if (!replaced) next.push(event)
+    for (var j = 0; j < order.length; j++) if (replacements[order[j]]) next.push(replacements[order[j]])
     cachedEvents = Model.normalizeEvents(next)
     showActiveRange()
   }

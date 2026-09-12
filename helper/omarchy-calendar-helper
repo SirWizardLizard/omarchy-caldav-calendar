@@ -899,8 +899,25 @@ def eds_create_event(calendar_id: str, title: str, start: datetime, end: datetim
     calendar["readonly"] = False
     component = modules.ECal.Component.new_from_icalcomponent(ical.clone())
     event = component_event(component, calendar)
-    merge_cache_event(event)
-    return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "event": event, "uid": created_uid or uid}
+    created_events = created_event_instances(modules, client, component, calendar, event, start, end, rrule)
+    merge_cache_created_series(created_events, event)
+    return {"ok": True, "provider": "evolution-data-server", "calendar": calendar, "event": event, "events": created_events, "uid": created_uid or uid}
+
+
+def created_event_instances(modules: EdsModules, client, component, calendar: dict, event: dict, start: datetime, end: datetime, rrule: str) -> list:
+    if not rrule:
+        return [event]
+    cached = read_cache() or {}
+    cached_range = cached.get("range") if isinstance(cached.get("range"), dict) else {}
+    cached_start = parse_event_instant(cached_range.get("start"))
+    cached_end = parse_event_instant(cached_range.get("end"))
+    now = datetime.now(UTC)
+    window_start = min(start, cached_start or now - timedelta(days=400))
+    window_end = max(end, cached_end or now + timedelta(days=400))
+    expanded = []
+    if append_component_events(client, component, calendar, window_start, window_end, expanded, modules):
+        return expanded or [event]
+    return [event]
 
 
 def apply_meeting(kind: str, url: str, location: str) -> str:
@@ -3167,6 +3184,21 @@ def merge_cache_event(event: dict, series: bool = False) -> None:
             events = [existing for existing in (cache.get("events") or []) if existing.get("id") != local_event.get("id")]
             events.append(local_event)
             cache["events"] = events
+    mutate_cache(merge, create=True)
+
+
+def merge_cache_created_series(events: list, event: dict) -> None:
+    if not event or not event.get("uid") or not event.get("calendarId"):
+        return
+
+    def merge(cache):
+        note_event_touch(cache, event, "create", "series")
+        cache["events"] = [
+            existing
+            for existing in (cache.get("events") or [])
+            if existing.get("uid") != event.get("uid") or existing.get("calendarId") != event.get("calendarId")
+        ] + list(events or [event])
+
     mutate_cache(merge, create=True)
 
 
