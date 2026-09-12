@@ -66,3 +66,23 @@ if ! grep -q 'payload.events && payload.events.length ? payload.events' "$ROOT/S
   exit 1
 fi
 echo "ok - recurring creates use expanded helper occurrences"
+
+python3 - "$ROOT/Panel.qml" "$ROOT/Service.qml" <<'PY'
+import re
+import sys
+
+panel = open(sys.argv[1]).read()
+service = open(sys.argv[2]).read()
+commit = re.search(r"function commitCreatingEvent\(\) \{(.*?)\n  \}", panel, re.S)
+if commit is None:
+    raise SystemExit("not ok - create event submit handler is missing")
+body = commit.group(1)
+closed = body.find("creatingEvent = false")
+deferred = body.find("Qt.callLater(function()")
+dispatched = body.find("service.createEvent(")
+if closed < 0 or deferred < 0 or dispatched < 0 or not closed < deferred < dispatched:
+    raise SystemExit("not ok - create dialog must close before deferred event creation")
+if "mergeEvents(expanded)" not in service or "mergeEvent(expanded[i])" in service:
+    raise SystemExit("not ok - optimistic recurring events must be merged in one batch")
+print("ok - create dialog closes before batched optimistic event creation")
+PY

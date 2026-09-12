@@ -708,6 +708,7 @@ Panel {
   }
 
   function commitCreatingEvent() {
+    if (!creatingEvent) return
     createDateKey = Model.nextOccurrenceDate(createDateKey, createRecurrence)
     var startIso = createAllDay ? createDateKey : Model.dateTimeIso(createDateKey, createStartTime)
     var endIso = createAllDay ? Model.nextDateKey(createDateKey) : Model.endDateTimeIso(createDateKey, createStartTime, createEndTime)
@@ -735,11 +736,21 @@ Panel {
     root.createMeetingKind = meetingUrl ? "link" : "none"
     var location = locationField.text
     if (meetingUrl && location.indexOf(meetingUrl) < 0 && location.indexOf(meetingInput) < 0) location = location ? (location + " · " + meetingUrl) : meetingUrl
-    if (editingEvent) calendarService.updateEvent(editingEvent, titleField.text, startIso, endIso, location, editingEvent.description || "", root.editScope, createAllDay, createCalendarId, meetingUrl, root.createMeetingKind)
-    else calendarService.createEvent(calendarId, titleField.text, startIso, endIso, location, "", Model.serializeRecurrence(root.createRecurrence), createAllDay, meetingUrl, root.createMeetingKind)
+    var service = calendarService
+    var editedEvent = editingEvent
+    var title = titleField.text
+    var recurrence = Model.serializeRecurrence(root.createRecurrence)
+    var allDay = createAllDay
+    var meetingKind = root.createMeetingKind
+    var scope = root.editScope
+    var destinationCalendarId = createCalendarId
     creatingEvent = false
     editingEvent = null
     createError = ""
+    Qt.callLater(function() {
+      if (editedEvent) service.updateEvent(editedEvent, title, startIso, endIso, location, editedEvent.description || "", scope, allDay, destinationCalendarId, meetingUrl, meetingKind)
+      else service.createEvent(calendarId, title, startIso, endIso, location, "", recurrence, allDay, meetingUrl, meetingKind)
+    })
   }
 
   function openEvolution() {

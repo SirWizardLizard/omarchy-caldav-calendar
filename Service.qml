@@ -617,8 +617,8 @@ Item {
     for (var i = 0; i < expanded.length; i++) {
       expanded[i].id = pendingCreateId + ":" + i
       expanded[i].status = "saving"
-      mergeEvent(expanded[i])
     }
+    mergeEvents(expanded)
     createProc.command = [
       helperPath(), "create-event",
       "--provider", provider,
