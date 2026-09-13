@@ -58,6 +58,16 @@ Same form. Use the provider’s CalDAV URL and an app password when they require
 - Nextcloud: `https://your-server/remote.php/dav/`
 - Fastmail: `https://caldav.fastmail.com/`
 
+## Subscribe to an iCalendar feed
+
+For a read-only `.ics` or iCalendar subscription URL:
+
+1. Click the clock → **Add calendar** → **iCalendar**
+2. Enter a display name and the subscription URL
+3. Click **Add subscription**
+
+No username or password is needed when access is provided by a token in the URL. Subscription events refresh automatically and cannot be created, edited, or deleted from this plugin.
+
 ## Meetings
 
 Paste a Zoom, Meet, or Teams URL on the event (`meet.google.com/…` is fine). **Join** opens it. The plugin does not sign in to Google, Zoom, or Outlook.

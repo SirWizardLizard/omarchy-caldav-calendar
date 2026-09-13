@@ -42,6 +42,13 @@ fi
 jq -e '.ok == false and .error.code == "operation-failed"' "$tmp" >/dev/null
 echo "ok - helper setup-caldav validates required fields"
 
+if printf '{}' | "$ROOT/helper/omarchy-calendar-helper" setup-webcal --provider evolution-data-server >"$tmp" 2>/dev/null; then
+  echo "not ok - setup-webcal without URL should fail" >&2
+  exit 1
+fi
+jq -e '.ok == false and .error.code == "operation-failed"' "$tmp" >/dev/null
+echo "ok - helper setup-webcal validates required fields"
+
 if "$ROOT/helper/omarchy-calendar-helper" remove-calendar --provider evolution-data-server >"$tmp" 2>/dev/null; then
   echo "not ok - remove-calendar without id should fail" >&2
   exit 1

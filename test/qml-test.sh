@@ -108,3 +108,23 @@ if "mergeEvents(expanded)" not in service or "mergeEvent(expanded[i])" in servic
     raise SystemExit("not ok - optimistic recurring events must be merged in one batch")
 print("ok - create dialog closes before batched optimistic event creation")
 PY
+
+python3 - "$ROOT/Panel.qml" "$ROOT/Service.qml" <<'PY'
+import re
+import sys
+
+panel = open(sys.argv[1]).read()
+service = open(sys.argv[2]).read()
+default_writable = re.search(r"function defaultWritableCalendarId\(\) \{(.*?)\n  \}", service, re.S)
+if default_writable is None or 'return ""' not in default_writable.group(1):
+    raise SystemExit("not ok - read-only calendars can be selected as writable fallbacks")
+for function in ("createEvent", "updateEvent", "deleteEvent"):
+    body = re.search(rf"function {function}\([^)]*\) \{{(.*?)\n  \}}", service, re.S)
+    if body is None or "rejectReadonlyMutation()" not in body.group(1):
+        raise SystemExit(f"not ok - {function} does not reject read-only calendars")
+if "function eventIsReadonly(event)" not in panel or "root.eventIsRecurring(event) || root.eventIsReadonly(event)" not in panel:
+    raise SystemExit("not ok - read-only events still open the editor directly")
+if panel.count("visible: !root.eventIsReadonly(root.contextEvent)") < 2:
+    raise SystemExit("not ok - read-only event edit/remove actions are still visible")
+print("ok - read-only subscriptions expose no calendar mutations")
+PY

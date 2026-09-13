@@ -372,7 +372,7 @@ Item {
         for (var j = 0; j < added.length; j++) {
           var calendar = added[j]
           if (!calendar || !calendar.id) continue
-          calendar.readonly = false
+          if (calendar.readonly === undefined || calendar.readonly === null) calendar.readonly = false
           if (seen[calendar.id] >= 0) next[seen[calendar.id]] = calendar
           else next.push(calendar)
         }
@@ -416,7 +416,7 @@ Item {
     for (var i = 0; i < calendars.length; i++) {
       if (calendars[i] && calendars[i].readonly !== true) return calendars[i].id
     }
-    return calendars.length > 0 && calendars[0] ? calendars[0].id : ""
+    return ""
   }
 
   function calendarById(calendarId) {
@@ -424,6 +424,17 @@ Item {
       if (calendars[i] && calendars[i].id === calendarId) return calendars[i]
     }
     return null
+  }
+
+  function calendarIsReadonly(calendarId) {
+    var calendar = calendarById(calendarId)
+    return !!(calendar && calendar.readonly === true)
+  }
+
+  function rejectReadonlyMutation() {
+    status = "error"
+    errorMessage = "This calendar is read-only."
+    eventSaved(false, errorMessage)
   }
 
   function optimisticEvent(calendarId, id, uid, title, startIso, endIso, location, description, eventStatus, allDay) {
@@ -568,6 +579,10 @@ Item {
 
   function deleteEvent(event, scope) {
     if (!event || event.status === "saving" || !event.uid || String(event.id || "").indexOf("omarchy-calendar-pending-") === 0) return
+    if (calendarIsReadonly(event.calendarId) || event.provider === "webcal") {
+      rejectReadonlyMutation()
+      return
+    }
     var deleteScope = String(scope || (event.rid || event.recurring ? "this" : "all"))
     provider = "evolution-data-server"
     errorMessage = ""
@@ -605,13 +620,18 @@ Item {
   }
 
   function createEvent(calendarId, title, startIso, endIso, location, description, repeat, allDay, meetingUrl, meetingKind) {
+    var targetId = String(calendarId || defaultWritableCalendarId())
+    if (!targetId || calendarIsReadonly(targetId)) {
+      rejectReadonlyMutation()
+      return
+    }
     provider = "evolution-data-server"
     status = "saving"
     errorMessage = ""
     if (createProc.running) createProc.running = false
     discardInFlightSnapshot()
     pendingCreateId = "omarchy-calendar-pending-" + Date.now()
-    var pending = optimisticEvent(calendarId || defaultWritableCalendarId(), pendingCreateId, "", title, startIso, endIso, location, description, "saving", allDay)
+    var pending = optimisticEvent(targetId, pendingCreateId, "", title, startIso, endIso, location, description, "saving", allDay)
     var expanded = Model.expandRecurringEvent(pending, repeat, activeStart, activeEnd)
     if (!expanded.length) expanded = [pending]
     for (var i = 0; i < expanded.length; i++) {
@@ -622,7 +642,7 @@ Item {
     createProc.command = [
       helperPath(), "create-event",
       "--provider", provider,
-      "--calendar-id", String(calendarId || defaultWritableCalendarId()),
+      "--calendar-id", targetId,
       "--title", String(title || "(No title)"),
       "--from", String(startIso || ""),
       "--to", String(endIso || ""),
@@ -641,6 +661,11 @@ Item {
       root.eventSaved(false, "Could not save the event.")
       return
     }
+    var destId = String(calendarId || event.calendarId || defaultWritableCalendarId())
+    if (calendarIsReadonly(event.calendarId) || event.provider === "webcal" || !destId || calendarIsReadonly(destId)) {
+      rejectReadonlyMutation()
+      return
+    }
     var editScope = String(scope || (event.rid || event.recurring ? "this" : "all"))
     provider = "evolution-data-server"
     status = "saving"
@@ -655,7 +680,6 @@ Item {
       if (!seen[u] || seen[u].uid !== event.uid || seen[u].calendarId !== event.calendarId) continue
       if (editScope === "all" || seen[u].id === event.id) pendingUpdateEvents.push(copyEvent(seen[u]))
     }
-    var destId = String(calendarId || event.calendarId || defaultWritableCalendarId())
     var next = optimisticEvent(destId, event.id, event.uid, title, startIso, endIso, location, description, "saving", allDay)
     next.rid = event.rid || ""
     next.recurring = event.recurring === true
@@ -840,6 +864,22 @@ Item {
       password: String(password || "")
     })
     setupProc.command = [helperPath(), "setup-caldav", "--provider", provider]
+    setupProc.running = true
+    setupTimeout.restart()
+  }
+
+  function setupWebCal(displayName, url) {
+    if (setupBusy || setupProc.running) return
+    provider = "evolution-data-server"
+    status = "saving"
+    setupStatus = "Adding calendar subscription..."
+    errorMessage = ""
+    setupBusy = true
+    setupProc.secret = JSON.stringify({
+      displayName: String(displayName || "Calendar"),
+      url: String(url || "")
+    })
+    setupProc.command = [helperPath(), "setup-webcal", "--provider", provider]
     setupProc.running = true
     setupTimeout.restart()
   }

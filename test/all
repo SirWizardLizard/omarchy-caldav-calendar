@@ -11,6 +11,7 @@ bash "$ROOT/test/helper-test.sh"
 python3 "$ROOT/test/caldav-limit-test.py"
 bash "$ROOT/test/qml-test.sh"
 python3 "$ROOT/test/caldav-harness.py"
+python3 "$ROOT/test/webcal-harness.py"
 bash "$ROOT/test/write-test.sh"
 
 echo "ok - all tests"

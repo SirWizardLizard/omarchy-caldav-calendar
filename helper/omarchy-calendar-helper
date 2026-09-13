@@ -394,6 +394,10 @@ def eds_status() -> dict:
 
 def source_provider(source, registry, modules: EdsModules) -> str:
     eds = modules.EDataServer
+    if source.has_extension(eds.SOURCE_EXTENSION_CALENDAR):
+        calendar = source.get_extension(eds.SOURCE_EXTENSION_CALENDAR)
+        if calendar and calendar.get_backend_name() == "webcal":
+            return "webcal"
     if source.has_extension(eds.SOURCE_EXTENSION_GOA):
         return "gnome-online-accounts"
     if source.has_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND):
@@ -432,16 +436,20 @@ def source_webdav_url(source, modules: EdsModules) -> str:
     uri = source.get_extension(eds.SOURCE_EXTENSION_WEBDAV_BACKEND).dup_uri()
     if uri is None:
         return ""
-    scheme = uri.get_scheme() or "https"
+    scheme = (uri.get_scheme() or "https").lower()
     host = uri.get_host() or ""
     path = uri.get_path() or "/"
+    query = uri.get_query() or ""
     port = int(uri.get_port() or 0)
     if not host:
         return ""
+    authority_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     default_port = 443 if scheme == "https" else 80
     if port > 0 and port != default_port:
-        return f"{scheme}://{host}:{port}{path}"
-    return f"{scheme}://{host}{path}"
+        result = f"{scheme}://{authority_host}:{port}{path}"
+    else:
+        result = f"{scheme}://{authority_host}{path}"
+    return result + (f"?{query}" if query else "")
 
 
 def source_calendar(source, registry, modules: EdsModules) -> dict:
@@ -1300,10 +1308,11 @@ def discover_caldav_calendars(url: str, username: str, password: str) -> list[di
 
 
 def glib_parse_uri(modules: EdsModules, url: str):
-    flags = [modules.GLib.UriFlags.NONE]
+    flags = []
     encoded = getattr(modules.GLib.UriFlags, "ENCODED", None)
     if encoded is not None:
         flags.append(encoded)
+    flags.append(modules.GLib.UriFlags.NONE)
     last_error = None
     for flag in flags:
         try:
@@ -1471,6 +1480,99 @@ def eds_setup_caldav(payload: dict) -> dict:
         "calendar": source_calendar(source, registry, modules),
         "calendars": calendars,
     }
+
+
+def normalize_webcal_url(value: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        raise ValueError("iCalendar URL is required.")
+    if any(character.isspace() for character in url):
+        raise ValueError("iCalendar URL cannot contain spaces.")
+    if len(url) > MAX_DAV_HREF_CHARS:
+        raise ValueError("iCalendar URL is too long.")
+    if re.match(r"^webcal://", url, re.I):
+        url = "https://" + url.split("://", 1)[1]
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+        raise ValueError("iCalendar URL must include an http(s) scheme and host.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("iCalendar URL cannot include embedded credentials.")
+    if parsed.fragment:
+        raise ValueError("iCalendar URL cannot include a fragment.")
+    if any(character.isspace() for character in parsed.hostname):
+        raise ValueError("iCalendar URL host cannot contain spaces.")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("iCalendar URL has an invalid port.") from error
+    return url
+
+
+def eds_setup_webcal(payload: dict) -> dict:
+    display_name = str(payload.get("displayName") or "Calendar").strip()
+    url = normalize_webcal_url(payload.get("url") or "")
+    parsed = urlsplit(url)
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+
+    status, raw, _headers = caldav_http("GET", url, "", "", headers={"Accept": "text/calendar"}, timeout=10.0, raise_too_large=True)
+    if status != 200:
+        raise ValueError(f"iCalendar feed returned HTTP {status or 'connection error'}.")
+    text = raw.decode("utf-8-sig", "replace")
+    if "BEGIN:VCALENDAR" not in text.upper():
+        raise ValueError("The URL did not return an iCalendar feed.")
+
+    modules = load_eds_modules()
+    try:
+        parsed_feed = modules.ICalGLib.Component.new_from_string(text)
+    except Exception:
+        parsed_feed = None
+    if parsed_feed is None:
+        raise ValueError("The iCalendar feed could not be parsed.")
+    registry = modules.EDataServer.SourceRegistry.new_sync(None)
+    source = modules.EDataServer.Source.new_with_uid(f"omarchy-calendar-webcal-{uuid4()}", None)
+    if registry.ref_source("webcal-stub"):
+        source.set_parent("webcal-stub")
+    source.set_display_name(display_name or "Calendar")
+    source.set_enabled(True)
+
+    calendar = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_CALENDAR)
+    calendar.set_backend_name("webcal")
+    calendar.set_color("#8aadf4")
+    if hasattr(calendar, "set_selected"):
+        calendar.set_selected(True)
+
+    webdav = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_WEBDAV_BACKEND)
+    webdav.set_uri(glib_parse_uri(modules, url))
+    webdav.set_display_name(source.get_display_name())
+    webdav.set_color("#8aadf4")
+
+    auth = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_AUTHENTICATION)
+    auth.set_host(parsed.hostname or "")
+    auth.set_port(port)
+    auth.set_user("")
+    auth.set_method("none")
+    auth.set_remember_password(False)
+
+    offline = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_OFFLINE)
+    offline.set_stay_synchronized(True)
+    refresh = source.get_extension(modules.EDataServer.SOURCE_EXTENSION_REFRESH)
+    refresh.set_enabled(True)
+    refresh.set_interval_minutes(15)
+
+    source = commit_new_source(registry, source)
+    if source is None:
+        raise ValueError("Failed to save the iCalendar subscription.")
+    try:
+        modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, 10, None)
+    except Exception:
+        discard_committed_source(registry, source.get_uid())
+        raise
+    created = source_calendar(source, registry, modules)
+    created["readonly"] = True
+    merge_cache_calendars([created])
+    return {"ok": True, "provider": "evolution-data-server", "calendar": created}
 
 
 def sync_report_body(sync_token: str, *, include_calendar_data: bool = True, limited: bool = True) -> bytes:
@@ -1805,8 +1907,54 @@ def events_from_ics(ics_text: str, calendar: dict, client, modules: EdsModules, 
     components = ecal_components_from_ics(ics_text, modules, max(1, event_limit + 1))
     if not components:
         return [], False
+    masters = [component for component in components if not str(component.get_recurid_as_string() or "")]
+    exceptions = [component for component in components if str(component.get_recurid_as_string() or "")]
     events: list = []
-    for component in components:
+    for component in masters:
+        if not append_component_events(client, component, calendar, window_start, window_end, events, modules, event_limit, deadline):
+            return [], False
+    occurrence_starts = {str(event.get("id") or ""): parse_event_instant(event.get("start")) for event in events}
+    ranged = []
+    singles = []
+    for component in exceptions:
+        recurrence = component.get_recurid() if hasattr(component, "get_recurid") else None
+        kind = recurrence.get_kind() if recurrence is not None and hasattr(recurrence, "get_kind") else None
+        if kind == getattr(modules.ECal.ComponentRangeKind, "THISFUTURE", None):
+            recurrence_dt = recurrence.get_datetime() if hasattr(recurrence, "get_datetime") else None
+            recurrence_start, _all_day, _timezone = component_datetime(recurrence_dt, modules, client)
+            anchor = parse_event_instant(recurrence_start)
+            if anchor is None:
+                return [], False
+            ranged.append((anchor, component))
+        elif kind in (None, getattr(modules.ECal.ComponentRangeKind, "SINGLE", None)):
+            singles.append(component)
+        else:
+            return [], False
+    ranged.sort(key=lambda item: item[0])
+    for anchor, component in ranged:
+        if deadline is not None and time.monotonic() >= deadline:
+            return [], False
+        base = component_event(component, calendar, modules, client)
+        replacement_start = parse_event_instant(base.get("start"))
+        replacement_end = parse_event_instant(base.get("end"))
+        if not base.get("uid") or replacement_start is None or replacement_end is None:
+            return [], False
+        shift = replacement_start - anchor
+        duration = replacement_end - replacement_start
+        for index, event in enumerate(events):
+            original_start = occurrence_starts.get(str(event.get("id") or ""))
+            if event.get("uid") != base["uid"] or not event.get("rid") or original_start is None or original_start < anchor:
+                continue
+            start = original_start + shift
+            end = start + duration
+            replacement = dict(base)
+            replacement["start"] = start.date().isoformat() if base["allDay"] else iso(start)
+            replacement["end"] = end.date().isoformat() if base["allDay"] else iso(end)
+            replacement["rid"] = event["rid"]
+            replacement["id"] = event["id"]
+            replacement["recurring"] = True
+            events[index] = replacement
+    for component in singles:
         if not append_component_events(client, component, calendar, window_start, window_end, events, modules, event_limit, deadline):
             return [], False
     return events, True
@@ -1820,7 +1968,7 @@ def ics_data_missing(ics_text: str) -> bool:
     return not str(ics_text or "").strip()
 
 
-def valid_non_event_calendar_data(ics_text: str, modules: EdsModules) -> bool:
+def valid_non_event_calendar_data(ics_text: str, modules: EdsModules, allow_empty: bool = False) -> bool:
     unfolded = str(ics_text or "").replace("\r\n", "\n").replace("\r", "\n")
     unfolded = re.sub(r"\n[ \t]", "", unfolded)
     stack = []
@@ -1861,7 +2009,7 @@ def valid_non_event_calendar_data(ics_text: str, modules: EdsModules) -> bool:
             has_prodid = True
         elif len(stack) == 2 and stack[-1] not in ("VEVENT", "VTIMEZONE") and property_name == "UID" and value.strip():
             primary_uids[-1] = True
-    if stack or root_count != 1 or not has_version or not has_prodid or has_event or not primary_uids or not all(primary_uids):
+    if stack or root_count != 1 or not has_version or not has_prodid or has_event or (not primary_uids and not allow_empty) or not all(primary_uids):
         return False
     try:
         parser = modules.ICalGLib.Component.new_from_string
@@ -2099,6 +2247,53 @@ def remember_sync_state(state: dict, calendar_id: str, **fields) -> dict:
     current.update(fields)
     state[calendar_id] = current
     return current
+
+
+def webcal_sync_calendar(source, modules: EdsModules, calendar: dict, client, cache: dict | None, window_start: datetime, window_end: datetime, if_changed: bool = False, event_limit: int = MAX_EVENTS, deadline: float | None = None) -> tuple[str, list, list]:
+    calendar_id = calendar["id"]
+    state = sync_state_map(cache)
+    current = state.get(calendar_id) if isinstance(state.get(calendar_id), dict) else {}
+    href = source_webdav_url(source, modules)
+    if not href:
+        raise ValueError("iCalendar subscription URL is missing.")
+    headers = {"Accept": "text/calendar"}
+    can_reuse = if_changed and current.get("filled") is True
+    if can_reuse and current.get("etag"):
+        headers["If-None-Match"] = str(current["etag"])
+    if can_reuse and current.get("lastModified"):
+        headers["If-Modified-Since"] = str(current["lastModified"])
+    deadline = deadline if deadline is not None else time.monotonic() + CALDAV_SYNC_SECONDS
+    status, raw, response_headers = budgeted_caldav_http([0], deadline, "GET", href, "", "", headers=headers)
+    if status == 304 and can_reuse:
+        return "unchanged", [], []
+    if status == 304:
+        raise ValueError("iCalendar feed returned an unexpected not-modified response.")
+    if status != 200:
+        raise ValueError(f"iCalendar feed returned HTTP {status or 'connection error'}.")
+    text = raw.decode("utf-8-sig", "replace")
+    if "BEGIN:VCALENDAR" not in text.upper():
+        raise ValueError("The URL did not return an iCalendar feed.")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Calendar synchronization timed out.")
+    remaining = deadline - time.monotonic()
+    with enforce_http_deadline(remaining):
+        non_event = valid_non_event_calendar_data(text, modules, allow_empty=True)
+        events, complete = ([], True) if non_event else events_from_ics(text, calendar, client, modules, window_start, window_end, event_limit, deadline)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Calendar synchronization timed out.")
+    if not complete:
+        raise ValueError("The iCalendar feed could not be parsed completely.")
+    remember_sync_state(
+        state,
+        calendar_id,
+        etag=str(response_headers.get("ETag") or "") if response_headers else "",
+        lastModified=str(response_headers.get("Last-Modified") or "") if response_headers else "",
+        filled=True,
+    )
+    if cache is not None:
+        cache["syncState"] = state
+    changed = {key for event in events for key in event_sync_keys(event) | event_occurrence_keys(event)}
+    return "updated", events, sorted(changed)
 
 
 def ctag_decision(state: dict, calendar_id: str, ctag: str, if_changed: bool) -> str:
@@ -2391,12 +2586,17 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
             continue
         if is_unresolved_caldav_root(source, registry, modules):
             continue
-        key = caldav_source_key(source, modules)
-        if key is not None:
-            if key in seen_caldav:
-                continue
-            seen_caldav.add(key)
+        source_kind = source_provider(source, registry, modules)
+        direct_webcal = source_kind == "webcal" and str(source.get_uid() or "").startswith("omarchy-calendar-webcal-")
+        if source_kind != "webcal":
+            key = caldav_source_key(source, modules)
+            if key is not None:
+                if key in seen_caldav:
+                    continue
+                seen_caldav.add(key)
         calendar = source_calendar(source, registry, modules)
+        if source_kind == "webcal":
+            calendar["readonly"] = True
         listed = False
         client = None
         cached_for_cal = [event for event in (cache.get("events") or []) if (event or {}).get("calendarId") == calendar["id"]]
@@ -2407,26 +2607,48 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
             if not include_events:
                 continue
             mode, synced, remote_uids = ("eds", [], [])
-            if source_provider(source, registry, modules) == "caldav":
+            if source_kind == "caldav":
                 try:
                     mode, synced, remote_uids = caldav_sync_calendar(source, registry, modules, calendar, None, cache, window_start, window_end, if_changed, [0], calendar_deadline)
                 except Exception as error:
                     sync_log("sync-calendar-error", calendarId=calendar.get("id"), error=str(error)[:200], ifChanged=if_changed)
                     mode, synced, remote_uids = (("unchanged", [], []) if cached_for_cal else ("eds", [], []))
+            elif direct_webcal:
+                remaining = calendar_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Calendar synchronization timed out.")
+                with enforce_http_deadline(remaining):
+                    client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, max(1, min(10, int(remaining))), None)
+                mode, synced, remote_uids = webcal_sync_calendar(
+                    source,
+                    modules,
+                    calendar,
+                    client,
+                    cache,
+                    window_start,
+                    window_end,
+                    if_changed,
+                    MAX_EVENTS - len(events),
+                    calendar_deadline,
+                )
             calendar_modes[calendar["id"]] = mode
             remote_touches[calendar["id"]] = remote_uids
             sync_log("sync-calendar", calendarId=calendar["id"], name=calendar.get("name"), host=calendar.get("host"), mode=mode, ifChanged=if_changed, cached=len(cached_for_cal))
             if mode == "unchanged":
-                calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly")
+                calendar["readonly"] = True if source_kind == "webcal" else (False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly"))
                 if len(events) + len(cached_for_cal) > MAX_EVENTS:
                     raise ValueError("Calendar snapshot exceeded the event limit.")
                 events.extend(cached_for_cal)
                 continue
             if mode == "updated":
-                calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly")
+                calendar["readonly"] = True if source_kind == "webcal" else (False if is_omarchy_source_uid(source.get_uid()) else calendar.get("readonly"))
                 if len(events) + len(synced) > MAX_EVENTS:
                     raise ValueError("Calendar snapshot exceeded the event limit.")
                 events.extend(synced)
+                if direct_webcal:
+                    full_map = cache.get("_full") if isinstance(cache.get("_full"), dict) else {}
+                    full_map[calendar["id"]] = True
+                    cache["_full"] = full_map
                 continue
             remaining = calendar_deadline - time.monotonic()
             if remaining <= 0:
@@ -2435,7 +2657,7 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
                 client = modules.ECal.Client.connect_sync(source, modules.ECal.ClientSourceType.EVENTS, max(1, min(10, int(remaining))), None)
             if time.monotonic() >= calendar_deadline:
                 raise TimeoutError("Calendar synchronization timed out.")
-            calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else bool(client.is_readonly())
+            calendar["readonly"] = True if source_kind == "webcal" else (False if is_omarchy_source_uid(source.get_uid()) else bool(client.is_readonly()))
             host = str(calendar.get("host") or "")
             pending_states = cache.get("_pendingSyncState") if isinstance(cache.get("_pendingSyncState"), dict) else {}
             pending_state = pending_states.get(calendar["id"]) if isinstance(pending_states.get(calendar["id"]), dict) else None
@@ -2472,7 +2694,7 @@ def eds_snapshot(start: datetime, end: datetime, include_events: bool = True, if
             sync_log("sync-eds-pull", calendarId=calendar["id"], pulled=len(pulled))
         except Exception as error:
             snapshot_incomplete = True
-            calendar["readonly"] = False if is_omarchy_source_uid(source.get_uid()) else True
+            calendar["readonly"] = True if source_kind == "webcal" else (False if is_omarchy_source_uid(source.get_uid()) else True)
             if not listed:
                 calendars.append(calendar)
             if len(events) + len(cached_for_cal) <= MAX_EVENTS:
@@ -3336,7 +3558,7 @@ def remove_cache_event(event_id: str) -> None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Return normalized calendar data as JSON")
-    parser.add_argument("operation", choices=["snapshot", "list-calendars", "create-event", "update-event", "delete-event", "setup-caldav", "create-local-calendar", "update-calendars", "remove-calendar", "reminders-state", "reminders-save", "ensure-center-anchor", "eds-status"])
+    parser.add_argument("operation", choices=["snapshot", "list-calendars", "create-event", "update-event", "delete-event", "setup-caldav", "setup-webcal", "create-local-calendar", "update-calendars", "remove-calendar", "reminders-state", "reminders-save", "ensure-center-anchor", "eds-status"])
     parser.add_argument("--provider", default=os.environ.get("OMARCHY_CALENDAR_PROVIDER", "mock"))
     parser.add_argument("--from", dest="start", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)))
     parser.add_argument("--to", dest="end", default=iso(datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=31)))
@@ -3396,6 +3618,11 @@ def main(argv: list[str]) -> int:
                 raise ValueError("setup-caldav currently requires the evolution-data-server provider.")
             raw = read_stdin_limited(MAX_REMINDER_BYTES)
             return emit_json(eds_setup_caldav(json.loads(raw or "{}")))
+        if args.operation == "setup-webcal":
+            if args.provider not in ("eds", "evolution-data-server"):
+                raise ValueError("setup-webcal currently requires the evolution-data-server provider.")
+            raw = read_stdin_limited(MAX_REMINDER_BYTES)
+            return emit_json(eds_setup_webcal(json.loads(raw or "{}")))
         if args.operation == "create-local-calendar":
             if args.provider not in ("eds", "evolution-data-server"):
                 raise ValueError("create-local-calendar currently requires the evolution-data-server provider.")
