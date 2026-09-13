@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
 import re
 import threading
@@ -28,6 +29,14 @@ class Store:
         self.token = 1
         self.stale_404s: list[str] = []
         self.truncate = False
+        self.page_size = 0
+        self.limit_mode = "honor"
+        self.omit_inline = False
+        self.multiget_supported = True
+        self.report_fail_after = 0
+        self.repeat_token = False
+        self.discovery_home = ""
+        self.stats = {"sync": 0, "multiget": 0, "get": 0, "propfind": 0, "authorized": 0}
         self.calendars = {
             "work": {"name": "Work", "events": {}},
             "personal": {"name": "Personal", "events": {}},
@@ -85,16 +94,20 @@ class Handler(BaseHTTPRequestHandler):
         user, _, password = raw.partition(":")
         return user == self.server.username and password == self.server.password
 
-    def _send(self, status: int, body: bytes, content_type: str = "application/xml; charset=utf-8") -> None:
+    def _send(self, status: int, body: bytes, content_type: str = "application/xml; charset=utf-8", headers: dict | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
     def _need_auth(self) -> bool:
         if self._authorized():
+            with self._store().lock:
+                self._store().stats["authorized"] += 1
             return False
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="caldav"')
@@ -110,7 +123,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/_control/state":
             with self._store().lock:
-                body = json.dumps({"token": self._store().token, "calendars": self._store().calendars}, default=str).encode()
+                store = self._store()
+                body = json.dumps({"token": store.token, "calendars": store.calendars, "stats": store.stats}, default=str).encode()
             self._send(200, body, "application/json")
             return
         if self._need_auth():
@@ -121,12 +135,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         calendar, filename = unquote(match.group(1)), unquote(match.group(2))
         with self._store().lock:
+            self._store().stats["get"] += 1
             event = ((self._store().calendars.get(calendar) or {}).get("events") or {}).get(filename)
             if not event or event["deleted"]:
                 self._send(404, b"")
                 return
             body = event["ics"].encode("utf-8")
-        self._send(200, body, "text/calendar; charset=utf-8")
+            etag = f'"{event["changed"]}"'
+        self._send(200, body, "text/calendar; charset=utf-8", {"ETag": etag})
 
     def do_PUT(self) -> None:
         if self._need_auth():
@@ -189,12 +205,20 @@ class Handler(BaseHTTPRequestHandler):
                 store.bump()
             elif op == "truncate":
                 store.truncate = bool(payload.get("on", True))
+            elif op == "config":
+                for name in ("page_size", "limit_mode", "omit_inline", "multiget_supported", "report_fail_after", "repeat_token", "discovery_home"):
+                    if name in payload:
+                        setattr(store, name, payload[name])
+            elif op == "reset-stats":
+                store.stats = {"sync": 0, "multiget": 0, "get": 0, "propfind": 0, "authorized": 0}
             else:
                 self._send(400, b"")
                 return
         self._send(200, b'{"ok":true}', "application/json")
 
     def do_PROPFIND(self) -> None:
+        with self._store().lock:
+            self._store().stats["propfind"] += 1
         if self._need_auth():
             return
         path = urlparse(self.path).path.rstrip("/") or "/"
@@ -203,6 +227,7 @@ class Handler(BaseHTTPRequestHandler):
             token = store.token_href()
             if path in ("/", "/dav", "/dav/user"):
                 if path == "/":
+                    extra_home = f"<c:calendar-home-set><d:href>{store.discovery_home}</d:href></c:calendar-home-set>" if store.discovery_home else ""
                     body = f"""<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:response>
@@ -211,6 +236,7 @@ class Handler(BaseHTTPRequestHandler):
       <d:prop>
         <d:resourcetype><d:collection/></d:resourcetype>
         <c:calendar-home-set><d:href>/dav/user/</d:href></c:calendar-home-set>
+        {extra_home}
         <d:current-user-principal><d:href>/dav/user/</d:href></d:current-user-principal>
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
@@ -274,14 +300,50 @@ class Handler(BaseHTTPRequestHandler):
             return
         slug = unquote(match.group(1))
         raw = self._read_body().decode("utf-8", "replace")
+        is_multiget = "calendar-multiget" in raw
+        store = self._store()
+        if is_multiget:
+            with store.lock:
+                store.stats["multiget"] += 1
+                if not store.multiget_supported:
+                    self._send(405, b"")
+                    return
+                calendar = store.calendars.get(slug)
+                if calendar is None:
+                    self._send(404, b"")
+                    return
+                rows = []
+                for requested in re.findall(r"<d:href>(.*?)</d:href>", raw, re.S):
+                    path = urlparse(html.unescape(requested.strip())).path
+                    event_match = re.fullmatch(rf"/dav/user/{re.escape(slug)}/([^/]+)\.ics", path)
+                    filename = unquote(event_match.group(1)) if event_match else ""
+                    event = calendar["events"].get(filename)
+                    href = f"/dav/user/{slug}/{filename}.ics" if filename else path
+                    if not event or event["deleted"]:
+                        rows.append(f"  <d:response><d:href>{href}</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>")
+                        continue
+                    ics = event["ics"].replace("&", "&amp;").replace("<", "&lt;")
+                    rows.append(
+                        f"""  <d:response><d:href>{href}</d:href><d:propstat><d:prop>
+    <d:getetag>"{event["changed"]}"</d:getetag><c:calendar-data>{ics}</c:calendar-data>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"""
+                    )
+                body = f"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">{"".join(rows)}</d:multistatus>""".encode()
+            self._send(207, body)
+            return
+
         token_match = re.search(r"<d:sync-token>([^<]*)</d:sync-token>", raw)
         client_token = (token_match.group(1) if token_match else "").strip()
         client_n = 0
         if client_token:
             num = re.search(r"/(\d+)$", client_token)
             client_n = int(num.group(1)) if num else 0
-        store = self._store()
         with store.lock:
+            store.stats["sync"] += 1
+            if store.report_fail_after and store.stats["sync"] > int(store.report_fail_after):
+                self._send(500, b"")
+                return
             calendar = store.calendars.get(slug)
             if calendar is None:
                 self._send(404, b"")
@@ -290,24 +352,39 @@ class Handler(BaseHTTPRequestHandler):
                 body = f"""<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
-    <d:href>/dav/user/{slug}/partial.ics</d:href>
+    <d:href>/dav/user/{slug}/</d:href>
     <d:status>HTTP/1.1 507 Insufficient Storage</d:status>
   </d:response>
   <d:sync-token>{store.token_href()}</d:sync-token>
 </d:multistatus>""".encode()
                 self._send(207, body)
                 return
+            limit_match = re.search(r"<d:nresults>(\d+)</d:nresults>", raw)
+            if limit_match and store.limit_mode == "reject":
+                self._send(507, b"")
+                return
             rows = []
+            candidates = []
             for filename, event in calendar["events"].items():
                 if event["changed"] <= client_n and client_n > 0:
                     continue
+                candidates.append((filename, event))
+            candidates.sort(key=lambda item: (item[1]["changed"], item[0]))
+            requested_limit = int(limit_match.group(1)) if limit_match and store.limit_mode == "honor" else 0
+            effective_limit = requested_limit
+            if store.page_size:
+                effective_limit = min(value for value in (requested_limit, int(store.page_size)) if value > 0) if requested_limit else int(store.page_size)
+            truncated = bool(effective_limit and len(candidates) > effective_limit)
+            selected = candidates[:effective_limit] if effective_limit else candidates
+            inline_requested = "calendar-data" in raw and not store.omit_inline
+            for filename, event in selected:
                 href = f"/dav/user/{slug}/{filename}.ics"
                 if event["deleted"]:
                     rows.append(
                         f"  <d:response><d:href>{href}</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"
                     )
                     continue
-                ics = event["ics"].replace("&", "&amp;").replace("<", "&lt;")
+                ics = event["ics"].replace("&", "&amp;").replace("<", "&lt;") if inline_requested else ""
                 rows.append(
                     f"""  <d:response>
     <d:href>{href}</d:href>
@@ -324,10 +401,17 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append(
                     f"  <d:response><d:href>/dav/user/{slug}/{name}.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>"
                 )
+            if truncated:
+                rows.append(f"  <d:response><d:href>/dav/user/{slug}/</d:href><d:status>HTTP/1.1 507 Insufficient Storage</d:status></d:response>")
+            page_token = store.token
+            if truncated and selected:
+                page_token = max(event["changed"] for _filename, event in selected)
+            if truncated and store.repeat_token and client_token:
+                page_token = client_n
             body = f"""<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
 {"".join(rows)}
-  <d:sync-token>{store.token_href()}</d:sync-token>
+  <d:sync-token>http://example.test/ns/sync/{page_token}</d:sync-token>
 </d:multistatus>""".encode()
         self._send(207, body)
 

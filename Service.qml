@@ -319,7 +319,8 @@ Item {
     var payload = Model.parseOperationResponse(text)
     if (exitCode === 0 && payload.ok) {
       root.removePendingCreates(root.pendingCreateId)
-      if (payload.event) root.mergeEvent(payload.event)
+      var created = payload.events && payload.events.length ? payload.events : (payload.event ? [payload.event] : [])
+      root.mergeEvents(created)
       root.status = "ready"
       root.errorMessage = ""
       root.eventCreated(payload.event)
@@ -415,7 +416,7 @@ Item {
     for (var i = 0; i < calendars.length; i++) {
       if (calendars[i] && calendars[i].readonly !== true) return calendars[i].id
     }
-    return calendars.length > 0 && calendars[0] ? calendars[0].id : ""
+    return ""
   }
 
   function calendarById(calendarId) {
@@ -423,6 +424,17 @@ Item {
       if (calendars[i] && calendars[i].id === calendarId) return calendars[i]
     }
     return null
+  }
+
+  function calendarIsReadonly(calendarId) {
+    var calendar = calendarById(calendarId)
+    return !!(calendar && calendar.readonly === true)
+  }
+
+  function rejectReadonlyMutation() {
+    status = "error"
+    errorMessage = "This calendar is read-only."
+    eventSaved(false, errorMessage)
   }
 
   function optimisticEvent(calendarId, id, uid, title, startIso, endIso, location, description, eventStatus, allDay) {
@@ -480,19 +492,32 @@ Item {
   }
 
   function mergeEvent(event) {
-    if (!event || !event.id) return
+    mergeEvents(event ? [event] : [])
+  }
+
+  function mergeEvents(items) {
+    var replacements = {}
+    var order = []
+    for (var itemIndex = 0; itemIndex < (items || []).length; itemIndex++) {
+      var item = items[itemIndex]
+      if (!item || !item.id) continue
+      var key = "$" + item.id
+      if (!replacements[key]) order.push(key)
+      replacements[key] = item
+    }
+    if (!order.length) return
     var next = []
-    var replaced = false
     var source = cachedEvents.length ? cachedEvents : events
     for (var i = 0; i < source.length; i++) {
-      if (source[i] && source[i].id === event.id) {
-        next.push(event)
-        replaced = true
+      var sourceKey = source[i] && source[i].id ? "$" + source[i].id : ""
+      if (sourceKey && replacements[sourceKey]) {
+        next.push(replacements[sourceKey])
+        delete replacements[sourceKey]
       } else {
         next.push(source[i])
       }
     }
-    if (!replaced) next.push(event)
+    for (var j = 0; j < order.length; j++) if (replacements[order[j]]) next.push(replacements[order[j]])
     cachedEvents = Model.normalizeEvents(next)
     showActiveRange()
   }
@@ -554,6 +579,10 @@ Item {
 
   function deleteEvent(event, scope) {
     if (!event || event.status === "saving" || !event.uid || String(event.id || "").indexOf("omarchy-calendar-pending-") === 0) return
+    if (calendarIsReadonly(event.calendarId) || event.provider === "webcal") {
+      rejectReadonlyMutation()
+      return
+    }
     var deleteScope = String(scope || (event.rid || event.recurring ? "this" : "all"))
     provider = "evolution-data-server"
     errorMessage = ""
@@ -591,24 +620,29 @@ Item {
   }
 
   function createEvent(calendarId, title, startIso, endIso, location, description, repeat, allDay, meetingUrl, meetingKind) {
+    var targetId = String(calendarId || defaultWritableCalendarId())
+    if (!targetId || calendarIsReadonly(targetId)) {
+      rejectReadonlyMutation()
+      return
+    }
     provider = "evolution-data-server"
     status = "saving"
     errorMessage = ""
     if (createProc.running) createProc.running = false
     discardInFlightSnapshot()
     pendingCreateId = "omarchy-calendar-pending-" + Date.now()
-    var pending = optimisticEvent(calendarId || defaultWritableCalendarId(), pendingCreateId, "", title, startIso, endIso, location, description, "saving", allDay)
+    var pending = optimisticEvent(targetId, pendingCreateId, "", title, startIso, endIso, location, description, "saving", allDay)
     var expanded = Model.expandRecurringEvent(pending, repeat, activeStart, activeEnd)
     if (!expanded.length) expanded = [pending]
     for (var i = 0; i < expanded.length; i++) {
       expanded[i].id = pendingCreateId + ":" + i
       expanded[i].status = "saving"
-      mergeEvent(expanded[i])
     }
+    mergeEvents(expanded)
     createProc.command = [
       helperPath(), "create-event",
       "--provider", provider,
-      "--calendar-id", String(calendarId || defaultWritableCalendarId()),
+      "--calendar-id", targetId,
       "--title", String(title || "(No title)"),
       "--from", String(startIso || ""),
       "--to", String(endIso || ""),
@@ -627,6 +661,11 @@ Item {
       root.eventSaved(false, "Could not save the event.")
       return
     }
+    var destId = String(calendarId || event.calendarId || defaultWritableCalendarId())
+    if (calendarIsReadonly(event.calendarId) || event.provider === "webcal" || !destId || calendarIsReadonly(destId)) {
+      rejectReadonlyMutation()
+      return
+    }
     var editScope = String(scope || (event.rid || event.recurring ? "this" : "all"))
     provider = "evolution-data-server"
     status = "saving"
@@ -641,7 +680,6 @@ Item {
       if (!seen[u] || seen[u].uid !== event.uid || seen[u].calendarId !== event.calendarId) continue
       if (editScope === "all" || seen[u].id === event.id) pendingUpdateEvents.push(copyEvent(seen[u]))
     }
-    var destId = String(calendarId || event.calendarId || defaultWritableCalendarId())
     var next = optimisticEvent(destId, event.id, event.uid, title, startIso, endIso, location, description, "saving", allDay)
     next.rid = event.rid || ""
     next.recurring = event.recurring === true

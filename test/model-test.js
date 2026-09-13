@@ -90,10 +90,12 @@ assert.equal(response.ok, true)
 assert.equal(response.provider, 'mock')
 assert.equal(response.events.length, 2)
 
-const operation = model.parseOperationResponse(JSON.stringify({ ok: true, provider: 'evolution-data-server', uid: 'abc', event: { id: 'abc', title: 'Created', start: '2026-08-20T09:00:00Z' } }))
+const operation = model.parseOperationResponse(JSON.stringify({ ok: true, provider: 'evolution-data-server', uid: 'abc', event: { id: 'abc', title: 'Created', start: '2026-08-20T09:00:00Z' }, events: [{ id: 'abc:1', uid: 'abc', rid: '1', title: 'Created', start: '2026-08-20T09:00:00Z' }] }))
 assert.equal(operation.ok, true)
 assert.equal(operation.uid, 'abc')
 assert.equal(operation.event.title, 'Created')
+assert.equal(operation.events.length, 1)
+assert.equal(operation.events[0].rid, '1')
 
 const bad = model.parseHelperResponse('{')
 assert.equal(bad.ok, false)
