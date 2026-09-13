@@ -15,7 +15,9 @@ import json
 import os
 import re
 import signal
+import stat
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -48,6 +50,9 @@ MAX_CALDAV_REQUESTS = MAX_EVENTS + 2 * MAX_CALDAV_SYNC_PAGES
 CALDAV_SYNC_SECONDS = 45.0
 MAX_CALENDARS = 200
 MAX_FIRED = 2000
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_CACHE_FILES = ("cache.json", "cache.lock", "cache.dirty.json", "reminders.json", "sync.log")
 
 
 class CaldavResponseTooLarge(ValueError):
@@ -2807,26 +2812,87 @@ def invalidate_out_of_range_sync_state(cache: dict, start: datetime, end: dateti
     return True
 
 
-def sync_log(message: str, **fields) -> None:
+def secure_private_directory(path: Path) -> Path:
+    path.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise OSError(f"Private state directory is unsafe: {path}")
+    os.chmod(path, PRIVATE_DIR_MODE)
+    return path
+
+
+def secure_private_file(path: Path) -> None:
     try:
-        path = cache_dir() / "sync.log"
-        line = {"at": iso(datetime.now(UTC)), "message": message}
-        line.update(fields)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(line, separators=(",", ":")) + "\n")
-    except Exception:
+        info = path.lstat()
+    except FileNotFoundError:
         return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise OSError(f"Private state file is unsafe: {path}")
+    os.chmod(path, PRIVATE_FILE_MODE, follow_symlinks=False)
+
+
+def private_text_file(path: Path, flags: int, mode: str):
+    secure_private_file(path)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, PRIVATE_FILE_MODE)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise OSError(f"Private state file is unsafe: {path}")
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        return os.fdopen(descriptor, mode, encoding="utf-8")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def atomic_write_text(path: Path, text: str, final_mode: int = PRIVATE_FILE_MODE) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(text)
+        if final_mode != PRIVATE_FILE_MODE:
+            os.chmod(temporary, final_mode, follow_symlinks=False)
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def cache_dir() -> Path:
     override = os.environ.get("OMARCHY_CALENDAR_CACHE")
     path = Path(override) if override else Path.home() / ".local/share/omarchy-calendar"
-    path.mkdir(parents=True, exist_ok=True)
+    secure_private_directory(path)
+    for name in PRIVATE_CACHE_FILES:
+        try:
+            secure_private_file(path / name)
+        except OSError:
+            pass
     return path
 
 
+def sync_log(message: str, **fields) -> None:
+    try:
+        path = cache_dir() / "sync.log"
+        line = {"at": iso(datetime.now(UTC)), "message": message}
+        line.update(fields)
+        with private_text_file(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, "a") as handle:
+            handle.write(json.dumps(line, separators=(",", ":")) + "\n")
+    except Exception:
+        return
+
+
 def cache_file() -> Path:
-    return cache_dir() / "cache.json"
+    path = cache_dir() / "cache.json"
+    secure_private_file(path)
+    return path
 
 
 def shell_config_path() -> Path:
@@ -2837,9 +2903,12 @@ def shell_config_path() -> Path:
 def ensure_center_anchor(plugin_id: str) -> dict:
     plugin_id = str(plugin_id or "").strip()
     path = shell_config_path()
-    if not plugin_id or not path.is_file():
+    if not plugin_id:
         return {"ok": True, "changed": False}
     try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            return {"ok": True, "changed": False}
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"ok": True, "changed": False}
@@ -2856,18 +2925,16 @@ def ensure_center_anchor(plugin_id: str) -> dict:
     updated = text.replace('"centerAnchor": "omarchy.clock"', f'"centerAnchor": "{plugin_id}"', 1)
     if updated == text:
         bar["centerAnchor"] = plugin_id
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_text(path, json.dumps(data, indent=2) + "\n", stat.S_IMODE(info.st_mode))
     else:
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(updated, encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_text(path, updated, stat.S_IMODE(info.st_mode))
     return {"ok": True, "changed": True, "centerAnchor": plugin_id}
 
 
 def reminders_file() -> Path:
-    return cache_dir() / "reminders.json"
+    path = cache_dir() / "reminders.json"
+    secure_private_file(path)
+    return path
 
 
 def read_reminders() -> dict:
@@ -2905,7 +2972,6 @@ def write_reminders(payload: dict) -> dict:
         fired = current["fired"]
     data = {"minutes": minutes, "fired": [str(item) for item in fired if item][:MAX_FIRED]}
     path = reminders_file()
-    tmp = path.with_suffix(".json.tmp")
     raw = json.dumps(data, separators=(",", ":"))
     if len(raw.encode("utf-8")) > MAX_REMINDER_BYTES:
         data["fired"] = data["fired"][: max(0, len(data["fired"]) // 2)]
@@ -2915,8 +2981,7 @@ def write_reminders(payload: dict) -> dict:
             raw = json.dumps(data, separators=(",", ":"))
     if len(raw.encode("utf-8")) > MAX_REMINDER_BYTES:
         return {"ok": False, "minutes": minutes, "fired": current["fired"], "error": {"code": "reminders-too-large", "message": "Reminder state was too large."}}
-    tmp.write_text(raw, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, raw)
     return {"ok": True, "minutes": minutes, "fired": data["fired"]}
 
 
@@ -3167,11 +3232,15 @@ def adopt_newer_cache_events(payload: dict, start_rev: int, modes: dict | None =
 
 
 def cache_lock_file() -> Path:
-    return cache_file().with_suffix(".lock")
+    path = cache_dir() / "cache.lock"
+    secure_private_file(path)
+    return path
 
 
 def dirty_touches_file() -> Path:
-    return cache_file().with_suffix(".dirty.json")
+    path = cache_dir() / "cache.dirty.json"
+    secure_private_file(path)
+    return path
 
 
 def merge_touch_maps(*maps: dict) -> dict:
@@ -3214,13 +3283,7 @@ def write_dirty_touches(touches: dict) -> None:
     raw = json.dumps({"rev": touch_map_rev(normalized), "localTouches": normalized}, separators=(",", ":"))
     if len(raw.encode("utf-8")) > MAX_CACHE_BYTES:
         raise OSError("Calendar mutation journal exceeded its safety limit.")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4()}.tmp")
-    try:
-        tmp.write_text(raw, encoding="utf-8")
-        tmp.replace(path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+    atomic_write_text(path, raw)
 
 
 def write_cache_locked(payload: dict, bump: bool, disk: dict | None) -> dict | None:
@@ -3265,28 +3328,22 @@ def write_cache_locked(payload: dict, bump: bool, disk: dict | None) -> dict | N
     if len(raw.encode("utf-8")) > MAX_CACHE_BYTES:
         sync_log("cache-write-rejected", calendars=len(calendars), events=len(events), reason="byte-limit")
         return None
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid4()}.tmp")
+    atomic_write_text(path, raw)
     try:
-        tmp.write_text(raw, encoding="utf-8")
-        tmp.replace(path)
-        try:
-            write_dirty_touches({})
-        except OSError as error:
-            sync_log("mutation-journal-clear-failed", error=str(error)[:200])
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+        write_dirty_touches({})
+    except OSError as error:
+        sync_log("mutation-journal-clear-failed", error=str(error)[:200])
     return data
 
 
 def write_cache(payload: dict, bump: bool = False) -> dict | None:
-    with cache_lock_file().open("a+", encoding="utf-8") as lock:
+    with private_text_file(cache_lock_file(), os.O_RDWR | os.O_CREAT | os.O_APPEND, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         return write_cache_locked(payload, bump, read_cache())
 
 
 def mutate_cache(mutator, create: bool = False) -> dict | None:
-    with cache_lock_file().open("a+", encoding="utf-8") as lock:
+    with private_text_file(cache_lock_file(), os.O_RDWR | os.O_CREAT | os.O_APPEND, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         disk = read_cache()
         if disk is None and not create:

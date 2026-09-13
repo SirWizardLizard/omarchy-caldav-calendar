@@ -8,6 +8,7 @@ for tz in UTC America/Chicago America/New_York Pacific/Honolulu Europe/London As
   TZ="$tz" node "$ROOT/test/model-test.js"
 done
 bash "$ROOT/test/helper-test.sh"
+python3 "$ROOT/test/permissions-test.py"
 python3 "$ROOT/test/caldav-limit-test.py"
 bash "$ROOT/test/qml-test.sh"
 python3 "$ROOT/test/caldav-harness.py"
