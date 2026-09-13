@@ -665,6 +665,10 @@ Panel {
     createRecurrence = next
   }
 
+  function restoreRecurrenceDropdownBinding(dropdown, field) {
+    dropdown.value = Qt.binding(function() { return String(root.createRecurrence[field]) })
+  }
+
   function setRecurrenceFreq(freq) {
     var next = Model.copyRecurrence(createRecurrence)
     var date = Model.dateFromKey(createDateKey, today)
@@ -708,6 +712,7 @@ Panel {
   }
 
   function commitCreatingEvent() {
+    if (!creatingEvent) return
     createDateKey = Model.nextOccurrenceDate(createDateKey, createRecurrence)
     var startIso = createAllDay ? createDateKey : Model.dateTimeIso(createDateKey, createStartTime)
     var endIso = createAllDay ? Model.nextDateKey(createDateKey) : Model.endDateTimeIso(createDateKey, createStartTime, createEndTime)
@@ -735,11 +740,21 @@ Panel {
     root.createMeetingKind = meetingUrl ? "link" : "none"
     var location = locationField.text
     if (meetingUrl && location.indexOf(meetingUrl) < 0 && location.indexOf(meetingInput) < 0) location = location ? (location + " · " + meetingUrl) : meetingUrl
-    if (editingEvent) calendarService.updateEvent(editingEvent, titleField.text, startIso, endIso, location, editingEvent.description || "", root.editScope, createAllDay, createCalendarId, meetingUrl, root.createMeetingKind)
-    else calendarService.createEvent(calendarId, titleField.text, startIso, endIso, location, "", Model.serializeRecurrence(root.createRecurrence), createAllDay, meetingUrl, root.createMeetingKind)
+    var service = calendarService
+    var editedEvent = editingEvent
+    var title = titleField.text
+    var recurrence = Model.serializeRecurrence(root.createRecurrence)
+    var allDay = createAllDay
+    var meetingKind = root.createMeetingKind
+    var scope = root.editScope
+    var destinationCalendarId = createCalendarId
     creatingEvent = false
     editingEvent = null
     createError = ""
+    Qt.callLater(function() {
+      if (editedEvent) service.updateEvent(editedEvent, title, startIso, endIso, location, editedEvent.description || "", scope, allDay, destinationCalendarId, meetingUrl, meetingKind)
+      else service.createEvent(calendarId, title, startIso, endIso, location, "", recurrence, allDay, meetingUrl, meetingKind)
+    })
   }
 
   function openEvolution() {
@@ -1049,6 +1064,7 @@ Panel {
                     spacing: Style.space(8)
 
                     Dropdown {
+                      id: recurrenceFrequencyDropdown
                       width: Style.space(168)
                       showLabel: false
                       value: root.createRecurrence.freq
@@ -1061,7 +1077,10 @@ Panel {
                       ]
                       foreground: Color.foreground
                       background: Color.popups.background
-                      onChanged: function(value) { root.setRecurrenceFreq(value) }
+                      onChanged: function(value) {
+                        root.setRecurrenceFreq(value)
+                        root.restoreRecurrenceDropdownBinding(recurrenceFrequencyDropdown, "freq")
+                      }
                     }
 
                     Row {
@@ -1099,6 +1118,7 @@ Panel {
                       visible: root.createRecurrence.freq === "monthly"
                       spacing: Style.space(6)
                       Dropdown {
+                        id: recurrenceMonthlyModeDropdown
                         width: Style.space(110)
                         showLabel: false
                         value: root.createRecurrence.monthlyMode
@@ -1108,9 +1128,13 @@ Panel {
                         ]
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ monthlyMode: value }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ monthlyMode: value })
+                          root.restoreRecurrenceDropdownBinding(recurrenceMonthlyModeDropdown, "monthlyMode")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceMonthlyDayDropdown
                         visible: root.createRecurrence.monthlyMode !== "byday"
                         width: Style.space(72)
                         showLabel: false
@@ -1118,9 +1142,13 @@ Panel {
                         options: Model.monthDayOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ monthDay: parseInt(value, 10) || 1 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ monthDay: parseInt(value, 10) || 1 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceMonthlyDayDropdown, "monthDay")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceMonthlyOrdinalDropdown
                         visible: root.createRecurrence.monthlyMode === "byday"
                         width: Style.space(110)
                         showLabel: false
@@ -1128,9 +1156,13 @@ Panel {
                         options: Model.ordinalOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ bysetpos: parseInt(value, 10) || 1 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ bysetpos: parseInt(value, 10) || 1 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceMonthlyOrdinalDropdown, "bysetpos")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceMonthlyWeekdayDropdown
                         visible: root.createRecurrence.monthlyMode === "byday"
                         width: Style.space(130)
                         showLabel: false
@@ -1138,7 +1170,10 @@ Panel {
                         options: Model.weekdayNameOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ weekday: parseInt(value, 10) || 0 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ weekday: parseInt(value, 10) || 0 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceMonthlyWeekdayDropdown, "weekday")
+                        }
                       }
                     }
 
@@ -1146,6 +1181,7 @@ Panel {
                       visible: root.createRecurrence.freq === "yearly"
                       spacing: Style.space(6)
                       Dropdown {
+                        id: recurrenceYearlyModeDropdown
                         width: Style.space(110)
                         showLabel: false
                         value: root.createRecurrence.yearlyMode
@@ -1155,9 +1191,13 @@ Panel {
                         ]
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ yearlyMode: value }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ yearlyMode: value })
+                          root.restoreRecurrenceDropdownBinding(recurrenceYearlyModeDropdown, "yearlyMode")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceYearlyOrdinalDropdown
                         visible: root.createRecurrence.yearlyMode === "byday"
                         width: Style.space(110)
                         showLabel: false
@@ -1165,9 +1205,13 @@ Panel {
                         options: Model.ordinalOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ bysetpos: parseInt(value, 10) || 1 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ bysetpos: parseInt(value, 10) || 1 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceYearlyOrdinalDropdown, "bysetpos")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceYearlyWeekdayDropdown
                         visible: root.createRecurrence.yearlyMode === "byday"
                         width: Style.space(130)
                         showLabel: false
@@ -1175,18 +1219,26 @@ Panel {
                         options: Model.weekdayNameOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ weekday: parseInt(value, 10) || 0 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ weekday: parseInt(value, 10) || 0 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceYearlyWeekdayDropdown, "weekday")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceYearlyMonthDropdown
                         width: Style.space(130)
                         showLabel: false
                         value: String(root.createRecurrence.month)
                         options: Model.monthNameOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ month: parseInt(value, 10) || 1 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ month: parseInt(value, 10) || 1 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceYearlyMonthDropdown, "month")
+                        }
                       }
                       Dropdown {
+                        id: recurrenceYearlyDayDropdown
                         visible: root.createRecurrence.yearlyMode !== "byday"
                         width: Style.space(72)
                         showLabel: false
@@ -1194,7 +1246,10 @@ Panel {
                         options: Model.monthDayOptions()
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ monthDay: parseInt(value, 10) || 1 }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ monthDay: parseInt(value, 10) || 1 })
+                          root.restoreRecurrenceDropdownBinding(recurrenceYearlyDayDropdown, "monthDay")
+                        }
                       }
                     }
 
@@ -1210,6 +1265,7 @@ Panel {
                         font.pixelSize: Style.font.bodySmall
                       }
                       Dropdown {
+                        id: recurrenceEndDropdown
                         width: Style.space(120)
                         showLabel: false
                         value: root.createRecurrence.end
@@ -1220,7 +1276,10 @@ Panel {
                         ]
                         foreground: Color.foreground
                         background: Color.popups.background
-                        onChanged: function(value) { root.patchRecurrence({ end: value }) }
+                        onChanged: function(value) {
+                          root.patchRecurrence({ end: value })
+                          root.restoreRecurrenceDropdownBinding(recurrenceEndDropdown, "end")
+                        }
                       }
                       DatePicker {
                         visible: root.createRecurrence.end === "until"
@@ -1332,6 +1391,7 @@ Panel {
                       font.bold: true
                     }
                     Dropdown {
+                      id: createCalendarDropdown
                       width: parent.width
                       implicitHeight: Style.spacing.controlHeight
                       rowHeight: Style.spacing.controlHeight
@@ -1340,7 +1400,10 @@ Panel {
                       options: root.writableCalendarOptions()
                       foreground: Color.foreground
                       background: Color.popups.background
-                      onChanged: function(value) { root.createCalendarId = value }
+                      onChanged: function(value) {
+                        root.createCalendarId = value
+                        createCalendarDropdown.value = Qt.binding(function() { return root.createCalendarId })
+                      }
                     }
                   }
                 }
