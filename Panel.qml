@@ -4,6 +4,7 @@ import Quickshell
 import qs.Commons
 import qs.Ui
 import "CalendarModel.js" as Model
+import "Bridge.js" as Bridge
 
 Panel {
   id: root
@@ -14,7 +15,9 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
-  readonly property var calendarService: bar && bar.shell ? bar.shell.serviceFor(root.moduleName) : null
+  readonly property var directService: bar && bar.shell ? bar.shell.serviceFor(root.moduleName) : null
+  property var bridgedService: null
+  readonly property var calendarService: directService || bridgedService
 
   property date today: new Date()
   readonly property string todayKey: Model.keyForDate(today)
@@ -802,6 +805,14 @@ Panel {
     running: root.opened && root.edsLoading
     repeat: true
     onTriggered: { if (calendarService) calendarService.retryEdsSnapshot() }
+  }
+
+  Timer {
+    interval: 1000
+    running: !root.directService
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.bridgedService = Bridge.current()
   }
 
   Connections {
