@@ -33,6 +33,14 @@ if checked == 0:
 print(f"ok - {checked} stdin-enabled processes close stdin and clear secrets")
 PY
 
+for file in Service.qml Panel.qml; do
+  if ! grep -q 'import "Bridge.js" as Bridge' "$ROOT/$file"; then
+    echo "not ok - $file must import the sibling Bridge.js"
+    exit 1
+  fi
+done
+echo "ok - replacement-bar bridge is shared by Service and Panel"
+
 if ! grep -q "id: setupTimeout" "$ROOT/Service.qml"; then
   echo "not ok - setup timeout is missing"
   exit 1
